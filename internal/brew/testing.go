@@ -13,7 +13,7 @@ func NewTestServer(logger *log.Logger) *Server {
 		logger:  logger,
 		clients: map[string]*Client{},
 		nonces:  map[string]time.Time{},
-		tokens:  map[string]time.Time{},
+		tokens:  map[string]tokenEntry{},
 	}
 }
 

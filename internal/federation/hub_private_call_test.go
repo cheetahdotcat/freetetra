@@ -64,7 +64,7 @@ func (noopHandler) OnPeerCallReply(string, string, uint8, uint8)                
 func (noopHandler) OnPeerVoiceFrame(string, string, []byte)                      {}
 func (noopHandler) OnPeerSDSRelay(string, uint32, uint32, string)                {}
 func (noopHandler) OnPeerPositionSample(string, uint32, float64, float64, string) {}
-func (noopHandler) OnPeerStationUpdate(string, map[string]any)                   {}
+func (noopHandler) OnPeerStationUpdate(string, string, map[string]any)           {}
 func (noopHandler) GetLocalSubscribers() map[uint32][]uint32                     { return nil }
 func (noopHandler) GetUsersDBInfo() (string, int)                                { return "", 0 }
 func (noopHandler) DownloadUsersDBFrom(string) error                             { return nil }

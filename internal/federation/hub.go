@@ -66,7 +66,11 @@ type CallHandler interface {
 	OnPeerVoiceFrame(peerName string, callUUID string, frameData []byte)
 	OnPeerSDSRelay(peerName string, sourceISSI, destISSI uint32, sdsDataHex string)
 	OnPeerPositionSample(peerName string, issi uint32, lat, lon float64, repeater string)
-	OnPeerStationUpdate(peerName string, station map[string]any)
+	// OnPeerStationUpdate is invoked for inbound StationUpdate ctrl messages.
+	// `origin` is ctrl.Origin (the originating server name); `peerName` is the
+	// immediate sender. Implementations should attribute the station to origin
+	// — peerName may be a relay several hops removed.
+	OnPeerStationUpdate(origin, peerName string, station map[string]any)
 	GetLocalSubscribers() map[uint32][]uint32
 
 	// Users DB sync (optional — return empty if not available)
@@ -905,7 +909,7 @@ func (h *Hub) handlePositionSample(peer *Peer, ctrl *federationv2pb.Control, ps 
 
 func (h *Hub) handleStationUpdate(peer *Peer, ctrl *federationv2pb.Control, su *federationv2pb.StationUpdate) {
 	if h.handler != nil && su.GetStation() != nil {
-		h.handler.OnPeerStationUpdate(peer.Name, su.GetStation().AsMap())
+		h.handler.OnPeerStationUpdate(ctrl.GetOrigin(), peer.Name, su.GetStation().AsMap())
 	}
 	if h.mesh.ShouldRelay(ctrl) {
 		h.relayToPeers(h.mesh.PrepareRelay(ctrl), peer.Name)
@@ -1036,14 +1040,22 @@ func (h *Hub) BroadcastCallStart(callUUID string, sourceISSI, destGSSI uint32, p
 
 // BroadcastStation sendet einen BlueStation-Heartbeat an alle Peers
 // (Stations-Federation). Damit zeigen alle Server die gleiche Station-Liste.
-func (h *Hub) BroadcastStation(station map[string]any) {
+//
+// `origin` is the originating server name to stamp on ctrl.Origin. Pass "" for
+// a locally-owned station; the hub falls back to its own serverName. For a
+// relayed/anti-entropy broadcast, pass the station's known origin so the
+// receiver does not re-attribute it to us.
+func (h *Hub) BroadcastStation(origin string, station map[string]any) {
 	st, err := structpb.NewStruct(station)
 	if err != nil {
 		h.logger.Printf("federation: cannot encode station map: %v", err)
 		return
 	}
+	if origin == "" {
+		origin = h.serverName
+	}
 	ctrl := &federationv2pb.Control{
-		Origin: h.serverName,
+		Origin: origin,
 		Payload: &federationv2pb.Control_StationUpdate{
 			StationUpdate: &federationv2pb.StationUpdate{Station: st},
 		},

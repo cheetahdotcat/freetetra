@@ -49,7 +49,7 @@ type Server struct {
 	nonces  map[string]time.Time
 
 	tokenMu sync.Mutex
-	tokens  map[string]time.Time
+	tokens  map[string]tokenEntry
 
 	extraHandlers []httpHandlerRegistration
 	authVerifier  AuthVerifier
@@ -61,6 +61,15 @@ type Server struct {
 type httpHandlerRegistration struct {
 	pattern string
 	handler http.HandlerFunc
+}
+
+// tokenEntry is what we hand back to the client from /discovery. The username
+// is the digest-auth identity that just passed; carrying it lets the WS
+// handler stamp Client.Username so callers like service.OnConnect can join the
+// session to a Station via ByISSI(username).
+type tokenEntry struct {
+	exp      time.Time
+	username string
 }
 
 func NewServer(cfg config.Config, logger *log.Logger, handler EventHandler) *Server {
@@ -78,7 +87,7 @@ func NewServer(cfg config.Config, logger *log.Logger, handler EventHandler) *Ser
 		},
 		clients: make(map[string]*Client),
 		nonces:  make(map[string]time.Time),
-		tokens:  make(map[string]time.Time),
+		tokens:  make(map[string]tokenEntry),
 	}
 }
 
@@ -228,6 +237,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var username string
 	if s.authEnabled() {
 		clientIP := r.Header.Get("X-Real-IP")
 		if clientIP == "" {
@@ -241,7 +251,9 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !s.authorizeRequest(r) {
+		var ok bool
+		username, ok = s.authorizeRequest(r)
+		if !ok {
 			if s.authOnFailure != nil {
 				s.authOnFailure(clientIP)
 			}
@@ -254,7 +266,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	token := s.issueToken()
+	token := s.issueToken(username)
 	endpoint := fmt.Sprintf("%s/ws/%s", s.cfg.Server.Path, token)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -268,7 +280,8 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing endpoint token", http.StatusUnauthorized)
 		return
 	}
-	if !s.consumeToken(token) {
+	username, ok := s.consumeToken(token)
+	if !ok {
 		http.Error(w, "invalid endpoint token", http.StatusUnauthorized)
 		return
 	}
@@ -279,12 +292,12 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := randHex(8)
-	client := newClient(id, r.RemoteAddr, conn)
+	client := newClient(id, r.RemoteAddr, username, conn)
 	s.registerClient(client)
 	if s.handler != nil {
 		s.handler.OnConnect(client)
 	}
-	s.logger.Printf("client connected id=%s remote=%s", id, r.RemoteAddr)
+	s.logger.Printf("client connected id=%s remote=%s username=%s", id, r.RemoteAddr, username)
 
 	go s.writeLoop(client)
 	s.readLoop(client)
@@ -438,21 +451,24 @@ func (s *Server) authEnabled() bool {
 	return s.authVerifier != nil || strings.TrimSpace(s.cfg.Server.Username) != "" || strings.TrimSpace(s.cfg.Server.Password) != ""
 }
 
-func (s *Server) authorizeRequest(r *http.Request) bool {
+// authorizeRequest validates the digest Authorization header. On success it
+// returns the authenticated username so callers can stamp it on the issued
+// token (and downstream onto Client.Username for station joins).
+func (s *Server) authorizeRequest(r *http.Request) (string, bool) {
 	header := r.Header.Get("Authorization")
 	if !strings.HasPrefix(strings.ToLower(header), "digest ") {
-		return false
+		return "", false
 	}
 	params := parseDigestHeader(header)
 	username := params["username"]
 	realm := params["realm"]
 	if realm != s.cfg.Server.Realm {
-		return false
+		return "", false
 	}
 
 	nonce := params["nonce"]
 	if nonce == "" || !s.nonceValid(nonce) {
-		return false
+		return "", false
 	}
 
 	uri := params["uri"]
@@ -482,7 +498,7 @@ func (s *Server) authorizeRequest(r *http.Request) bool {
 				expected = md5Hex(fmt.Sprintf("%s:%s:%s", ha1, nonce, ha2))
 			}
 			if subtle.ConstantTimeCompare([]byte(strings.ToLower(response)), []byte(strings.ToLower(expected))) == 1 {
-				return true
+				return username, true
 			}
 		}
 
@@ -498,15 +514,18 @@ func (s *Server) authorizeRequest(r *http.Request) bool {
 			}
 			if subtle.ConstantTimeCompare([]byte(strings.ToLower(response)), []byte(strings.ToLower(expected))) == 1 {
 				// Digest matches — now verify username with RadioID
-				return s.authVerifier(username, pw)
+				if s.authVerifier(username, pw) {
+					return username, true
+				}
+				return "", false
 			}
 		}
-		return false
+		return "", false
 	}
 
 	// Static auth: single username/password from config
 	if username != s.cfg.Server.Username {
-		return false
+		return "", false
 	}
 
 	ha1 := md5Hex(fmt.Sprintf("%s:%s:%s", s.cfg.Server.Username, s.cfg.Server.Realm, s.cfg.Server.Password))
@@ -519,7 +538,10 @@ func (s *Server) authorizeRequest(r *http.Request) bool {
 		expected = md5Hex(fmt.Sprintf("%s:%s:%s", ha1, nonce, ha2))
 	}
 
-	return subtle.ConstantTimeCompare([]byte(strings.ToLower(response)), []byte(strings.ToLower(expected))) == 1
+	if subtle.ConstantTimeCompare([]byte(strings.ToLower(response)), []byte(strings.ToLower(expected))) == 1 {
+		return username, true
+	}
+	return "", false
 }
 
 func (s *Server) issueDigestChallenge(w http.ResponseWriter) {
@@ -556,27 +578,31 @@ func (s *Server) nonceValid(nonce string) bool {
 	return true
 }
 
-func (s *Server) issueToken() string {
+func (s *Server) issueToken(username string) string {
 	token := randHex(16)
-	expiresAt := time.Now().Add(s.cfg.Server.TokenTTL)
 	s.tokenMu.Lock()
-	s.tokens[token] = expiresAt
+	s.tokens[token] = tokenEntry{
+		exp:      time.Now().Add(s.cfg.Server.TokenTTL),
+		username: username,
+	}
 	s.tokenMu.Unlock()
 	return token
 }
 
-func (s *Server) consumeToken(token string) bool {
+// consumeToken returns the digest username captured at /discovery and ok=true
+// when the token is valid and unexpired.
+func (s *Server) consumeToken(token string) (string, bool) {
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()
-	exp, ok := s.tokens[token]
+	entry, ok := s.tokens[token]
 	if !ok {
-		return false
+		return "", false
 	}
 	delete(s.tokens, token)
-	if time.Now().After(exp) {
-		return false
+	if time.Now().After(entry.exp) {
+		return "", false
 	}
-	return true
+	return entry.username, true
 }
 
 func parseDigestHeader(header string) map[string]string {

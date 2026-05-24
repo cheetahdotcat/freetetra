@@ -10,8 +10,12 @@ import (
 type Client struct {
 	ID     string
 	Remote string
-	conn   *websocket.Conn
-	send   chan []byte
+	// Username is the digest-auth identity captured at /discovery (typically
+	// the BlueStation's ISSI as a decimal string). Empty when the server runs
+	// with auth disabled. Set once at construction; read-only afterwards.
+	Username string
+	conn     *websocket.Conn
+	send     chan []byte
 
 	mu          sync.RWMutex
 	subscribers map[uint32]*subscriberState
@@ -29,14 +33,16 @@ type SubscriberSnapshot struct {
 type ClientSnapshot struct {
 	ID          string               `json:"id"`
 	Remote      string               `json:"remote"`
+	Username    string               `json:"username,omitempty"`
 	Groups      []uint32             `json:"groups"`
 	Subscribers []SubscriberSnapshot `json:"subscribers"`
 }
 
-func newClient(id, remote string, conn *websocket.Conn) *Client {
+func newClient(id, remote, username string, conn *websocket.Conn) *Client {
 	return &Client{
 		ID:          id,
 		Remote:      remote,
+		Username:    username,
 		conn:        conn,
 		send:        make(chan []byte, 128),
 		subscribers: make(map[uint32]*subscriberState),
@@ -124,6 +130,7 @@ func (c *Client) Snapshot() ClientSnapshot {
 	return ClientSnapshot{
 		ID:          c.ID,
 		Remote:      c.Remote,
+		Username:    c.Username,
 		Groups:      collectGroupsNoLock(c.subscribers),
 		Subscribers: subs,
 	}

@@ -9,6 +9,7 @@ import {
   type PositionEntry,
   type PublicStatus,
   type Station,
+  type StationInput,
 } from "../api";
 
 const { t } = useI18n();
@@ -173,6 +174,118 @@ function gssiBadgeClass(g: number) {
 function gssiLabel(g: number) {
   return g >= 91 ? "TG " + g : String(g);
 }
+
+// --- station editor --------------------------------------------------------
+// `editing` doubles as the modal open flag (null = closed). For a new station
+// it's a blank draft with a freshly generated UUID; for an existing row it's
+// a copy so cancelling the edit doesn't mutate the table.
+interface StationDraft extends StationInput {
+  owned_issis_text: string; // raw comma-separated input; parsed on save
+}
+
+const editing = ref<StationDraft | null>(null);
+const editingIsNew = ref(false);
+const saving = ref(false);
+const saveError = ref<string>("");
+
+function emptyDraft(): StationDraft {
+  return {
+    station_id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : "",
+    callsign: "",
+    type: "hotspot",
+    lat: 0,
+    lon: 0,
+    dl_freq: 0,
+    ul_freq: 0,
+    power_w: 0,
+    antenna: "",
+    notes: "",
+    website: "",
+    owned_issis_text: "",
+  };
+}
+
+function openCreate() {
+  editing.value = emptyDraft();
+  editingIsNew.value = true;
+  saveError.value = "";
+}
+
+function openEdit(st: Station) {
+  editing.value = {
+    station_id: st.station_id,
+    callsign: st.callsign,
+    type: st.type,
+    lat: st.lat,
+    lon: st.lon,
+    dl_freq: st.dl_freq,
+    ul_freq: st.ul_freq,
+    power_w: st.power_w,
+    antenna: st.antenna,
+    notes: st.notes,
+    website: st.website,
+    owned_issis_text: (st.owned_issis ?? []).join(", "),
+  };
+  editingIsNew.value = false;
+  saveError.value = "";
+}
+
+function closeEditor() {
+  editing.value = null;
+  saveError.value = "";
+}
+
+async function saveEditing() {
+  if (!editing.value) return;
+  saving.value = true;
+  saveError.value = "";
+  try {
+    const issis: number[] = [];
+    for (const part of editing.value.owned_issis_text.split(",")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const n = Number(trimmed);
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new Error(`invalid ISSI "${trimmed}"`);
+      }
+      issis.push(n);
+    }
+    const payload: StationInput = {
+      station_id: editing.value.station_id,
+      callsign: editing.value.callsign.trim().toUpperCase(),
+      type: editing.value.type,
+      lat: Number(editing.value.lat),
+      lon: Number(editing.value.lon),
+      dl_freq: Number(editing.value.dl_freq),
+      ul_freq: Number(editing.value.ul_freq),
+      power_w: Number(editing.value.power_w),
+      antenna: editing.value.antenna,
+      notes: editing.value.notes,
+      website: editing.value.website,
+      owned_issis: issis.length ? issis : undefined,
+    };
+    await api.pushStation(payload);
+    closeEditor();
+    await update();
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function deleteStation(st: Station) {
+  const ok = window.confirm(
+    t("admin.station.confirm_delete", { callsign: st.callsign }),
+  );
+  if (!ok) return;
+  try {
+    await api.deleteStation(st.station_id);
+    await update();
+  } catch (e) {
+    window.alert(e instanceof Error ? e.message : String(e));
+  }
+}
 </script>
 
 <template>
@@ -204,8 +317,13 @@ function gssiLabel(g: number) {
 
       <div class="card">
         <h2>
-          {{ t("admin.tmo_site") }}
-          <span class="count">({{ stations.length }})</span>
+          <span>
+            {{ t("admin.tmo_site") }}
+            <span class="count">({{ stations.length }})</span>
+          </span>
+          <button class="btn btn-primary" type="button" @click="openCreate">
+            {{ t("admin.station.add") }}
+          </button>
         </h2>
         <div v-if="stations.length === 0" class="empty">{{ t("admin.empty.tmo_sites") }}</div>
         <div v-else class="table-wrap">
@@ -216,12 +334,28 @@ function gssiLabel(g: number) {
                 <th>{{ t("admin.col.status") }}</th>
                 <th>{{ t("admin.col.type") }}</th>
                 <th>{{ t("admin.col.last_act") }}</th>
+                <th class="actions-col">{{ t("admin.col.actions") }}</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="st in stations" :key="st.station_id">
                 <td>
                   <span class="badge badge-green">{{ st.callsign }}</span>
+                  <span v-if="st.origin" class="badge badge-blue small mono">{{ st.origin }}</span>
+                  <span
+                    v-if="st.live_brew_session_id"
+                    class="badge badge-orange small mono"
+                    :title="t('admin.station.live_brew_tip')"
+                  >
+                    BREW · {{ (st.live_brew_subscribers ?? []).length }}
+                  </span>
+                  <span
+                    v-if="st.live_telemetry"
+                    class="badge badge-blue small mono"
+                    :title="t('admin.station.live_telemetry_tip')"
+                  >
+                    TLM · {{ (st.live_telemetry_subscribers ?? []).length }}
+                  </span>
                   <span v-if="st.notes" class="notes"> — {{ st.notes }}</span>
                 </td>
                 <td>
@@ -231,6 +365,14 @@ function gssiLabel(g: number) {
                 </td>
                 <td class="mono dim">{{ st.type || "—" }}</td>
                 <td class="dim">{{ fmtUnixDate(st.last_seen) }}</td>
+                <td class="actions-col">
+                  <button class="btn btn-ghost" type="button" @click="openEdit(st)">
+                    {{ t("admin.station.edit") }}
+                  </button>
+                  <button class="btn btn-danger" type="button" @click="deleteStation(st)">
+                    {{ t("admin.station.delete") }}
+                  </button>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -380,6 +522,102 @@ function gssiLabel(g: number) {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div v-if="editing" class="modal-backdrop" @click.self="closeEditor">
+      <div class="modal">
+        <h3>
+          {{ editingIsNew ? t("admin.station.add") : t("admin.station.edit") }}
+        </h3>
+        <form @submit.prevent="saveEditing">
+          <div class="form-grid">
+            <label>
+              <span>{{ t("admin.col.callsign") }} *</span>
+              <input
+                v-model="editing.callsign"
+                type="text"
+                required
+                maxlength="16"
+                autocapitalize="characters"
+              />
+            </label>
+            <label>
+              <span>{{ t("admin.col.type") }} *</span>
+              <select v-model="editing.type" required>
+                <option value="hotspot">hotspot</option>
+                <option value="tmo_site">tmo_site</option>
+                <option value="bluestation">bluestation</option>
+              </select>
+            </label>
+            <label>
+              <span>{{ t("admin.col.lat") }} *</span>
+              <input
+                v-model.number="editing.lat"
+                type="number"
+                step="0.000001"
+                min="-90"
+                max="90"
+                required
+              />
+            </label>
+            <label>
+              <span>{{ t("admin.col.lon") }} *</span>
+              <input
+                v-model.number="editing.lon"
+                type="number"
+                step="0.000001"
+                min="-180"
+                max="180"
+                required
+              />
+            </label>
+            <label>
+              <span>{{ t("admin.station.dl_freq") }}</span>
+              <input v-model.number="editing.dl_freq" type="number" step="0.0001" min="0" />
+            </label>
+            <label>
+              <span>{{ t("admin.station.ul_freq") }}</span>
+              <input v-model.number="editing.ul_freq" type="number" step="0.0001" min="0" />
+            </label>
+            <label>
+              <span>{{ t("admin.station.power_w") }}</span>
+              <input v-model.number="editing.power_w" type="number" step="0.1" min="0" />
+            </label>
+            <label>
+              <span>{{ t("admin.station.antenna") }}</span>
+              <input v-model="editing.antenna" type="text" maxlength="128" />
+            </label>
+            <label class="span-2">
+              <span>{{ t("admin.station.website") }}</span>
+              <input v-model="editing.website" type="url" maxlength="256" />
+            </label>
+            <label class="span-2">
+              <span>{{ t("admin.station.owned_issis") }}</span>
+              <input
+                v-model="editing.owned_issis_text"
+                type="text"
+                inputmode="numeric"
+                :placeholder="t('admin.station.owned_issis_hint')"
+              />
+            </label>
+            <label class="span-2">
+              <span>{{ t("admin.station.notes") }}</span>
+              <textarea v-model="editing.notes" rows="2" maxlength="512" />
+            </label>
+          </div>
+
+          <div v-if="saveError" class="form-error">{{ saveError }}</div>
+
+          <div class="form-actions">
+            <button class="btn btn-ghost" type="button" :disabled="saving" @click="closeEditor">
+              {{ t("admin.station.cancel") }}
+            </button>
+            <button class="btn btn-primary" type="submit" :disabled="saving">
+              {{ saving ? t("admin.station.saving") : t("admin.station.save") }}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   </div>
@@ -616,6 +854,131 @@ td.dim,
 .table-wrap {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
+}
+
+.btn {
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--border-hover);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn-primary:hover:not(:disabled) {
+  background: rgba(110, 231, 183, 0.18);
+}
+.btn-ghost {
+  background: transparent;
+}
+.btn-danger {
+  background: transparent;
+  color: var(--red);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: var(--red);
+}
+
+.actions-col {
+  text-align: right;
+  white-space: nowrap;
+}
+.actions-col .btn {
+  margin-left: 6px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  z-index: 50;
+  padding: 40px 16px;
+  overflow-y: auto;
+}
+.modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 22px;
+  max-width: 560px;
+  width: 100%;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+}
+.modal h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.form-grid label.span-2 {
+  grid-column: 1 / -1;
+}
+.form-grid input,
+.form-grid select,
+.form-grid textarea {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+}
+.form-grid input:focus,
+.form-grid select:focus,
+.form-grid textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.form-grid textarea {
+  resize: vertical;
+  font-family: inherit;
+}
+
+.form-error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(248, 113, 113, 0.1);
+  color: var(--red);
+  font-size: 0.8rem;
+}
+.form-actions {
+  margin-top: 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 @media (max-width: 700px) {

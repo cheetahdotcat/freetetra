@@ -3,8 +3,11 @@ package service
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // TMOSiteHeartbeat tracks which TMO-sites are connected and how many
@@ -126,6 +129,28 @@ func (s *Service) handleTMOSiteHeartbeat(w http.ResponseWriter, r *http.Request)
 		s.tmoSites = newTMOSiteHeartbeat()
 	}
 	s.tmoSites.Update(req.Name, req.Callsign, ip, req.Subscribers)
+
+	// Mirror the heartbeat into the unified Station registry. Match by
+	// callsign; on miss + STATION_AUTO_CREATE=true, create a tmo_site stub
+	// pre-populated with the heartbeat's reported subscriber ISSIs.
+	if s.stationStore != nil && strings.TrimSpace(req.Callsign) != "" {
+		if st, ok := s.stationStore.ByCallsign(req.Callsign); ok {
+			s.stationStore.bumpLastSeen(st.StationID)
+		} else if s.cfg.Station.AutoCreate {
+			cs := strings.ToUpper(strings.TrimSpace(req.Callsign))
+			stub := Station{
+				StationID:  uuid.NewString(),
+				Callsign:   cs,
+				Type:       "tmo_site",
+				OwnedISSIs: append([]uint32(nil), req.Subscribers...),
+			}
+			if _, err := s.stationStore.Upsert(stub); err != nil {
+				s.logger.Printf("stations: TMO-heartbeat auto-create for %s failed: %v", cs, err)
+			} else {
+				s.logger.Printf("stations: auto-created %s from TMO heartbeat (subs=%d)", cs, len(req.Subscribers))
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true})

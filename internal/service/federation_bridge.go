@@ -143,11 +143,20 @@ func (fb *federationBridge) syncAllSubscribers() {
 			subCount++
 		}
 	}
-	// Stations mitsynchronisieren — falls ein Peer-Server neu connectet
-	// oder nach Netzaussetzer, kriegt er den aktuellen Stations-Stand.
+	// Stations mitsynchronisieren — nur unsere EIGENEN (Origin=="") werden
+	// re-broadcastet. Sonst konkurriert ein Relay-anti-entropy mit dem
+	// Originator-anti-entropy bei jedem Tick und der gespeicherte Origin
+	// kippt zwischen Werten hin und her. Foederierte Stationen propagieren
+	// weiterhin per Mesh-Relay beim Erstempfang; nur das periodische
+	// Re-Broadcasten ist auf den Originator beschraenkt (analog Subscribers).
+	// Tombstones einer lokalen Station gehoeren weiterhin dazu, damit Deletes
+	// konvergieren.
 	stCount := 0
 	if fb.svc.stationStore != nil {
-		for _, st := range fb.svc.stationStore.All() {
+		for _, st := range fb.svc.stationStore.AllIncludingDeleted() {
+			if st.Origin != "" {
+				continue
+			}
 			st := st // copy
 			fb.NotifyStationUpdate(&st)
 			stCount++
@@ -358,8 +367,10 @@ func (fb *federationBridge) OnPeerVoiceFrame(peerName string, callUUID string, f
 
 // OnPeerStationUpdate wird vom Federation-Hub aufgerufen, wenn ein Peer einen
 // BlueStation-Heartbeat (Station-Push) weiterreicht. Wir uebernehmen die Station
-// in unseren lokalen stationStore.
-func (fb *federationBridge) OnPeerStationUpdate(peerName string, stationMap map[string]any) {
+// in unseren lokalen stationStore. `origin` is ctrl.Origin (the originating
+// peer name); `peerName` is the immediate sender (last-hop relay). We tag the
+// station with the originator so multi-hop relays don't lose attribution.
+func (fb *federationBridge) OnPeerStationUpdate(origin, peerName string, stationMap map[string]any) {
 	if fb.svc.stationStore == nil || stationMap == nil {
 		return
 	}
@@ -371,8 +382,16 @@ func (fb *federationBridge) OnPeerStationUpdate(peerName string, stationMap map[
 	if err := json.Unmarshal(b, &st); err != nil {
 		return
 	}
+	// Trust ctrl.Origin over any origin field the sender embedded — prevents
+	// a peer from spoofing another peer's attribution. Fall back to peerName
+	// for forward-compat with peers that don't set ctrl.Origin.
+	if origin != "" {
+		st.Origin = origin
+	} else if st.Origin == "" {
+		st.Origin = peerName
+	}
 	if _, err := fb.svc.stationStore.Upsert(st); err != nil {
-		fb.logger.Printf("federation: station upsert from %s failed: %v", peerName, err)
+		fb.logger.Printf("federation: station upsert from %s (origin=%s) failed: %v", peerName, st.Origin, err)
 	}
 }
 
@@ -463,6 +482,9 @@ func (fb *federationBridge) NotifyPositionSample(issi uint32, lat, lon float64, 
 }
 
 // NotifyStationUpdate broadcasted einen BlueStation-Heartbeat an alle Peers.
+// st.Origin is forwarded as ctrl.Origin so anti-entropy rebroadcasts from a
+// relay don't re-attribute a federated station to the relay. Empty Origin
+// means "ours" — the hub stamps its own serverName.
 func (fb *federationBridge) NotifyStationUpdate(st *Station) {
 	if fb.hub == nil || st == nil {
 		return
@@ -477,7 +499,7 @@ func (fb *federationBridge) NotifyStationUpdate(st *Station) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return
 	}
-	fb.hub.BroadcastStation(m)
+	fb.hub.BroadcastStation(st.Origin, m)
 }
 
 // NotifyCallStart notifies peers about a local group call start.

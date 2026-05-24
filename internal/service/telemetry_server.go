@@ -33,8 +33,15 @@ type TelemetryEvent struct {
 
 // TelemetryClient represents a connected BlueStation telemetry feed.
 type TelemetryClient struct {
-	Name         string
-	RemoteIP     string
+	Name     string
+	RemoteIP string
+	// ISSI is the BlueStation's identity captured from the basic-auth user at
+	// connect time. Zero when auth was skipped. Used to join this telemetry
+	// feed to a Station via the station registry's ByISSI reverse-index.
+	ISSI uint32
+	// StationID is the resolved station this feed belongs to (set by
+	// LinkOrCreate on connect; empty if no match and auto-create was off).
+	StationID    string
 	Conn         *websocket.Conn
 	ConnectedAt  time.Time
 	LastActivity time.Time
@@ -77,20 +84,23 @@ func newTelemetryServer(logger *log.Logger, svc *Service) *TelemetryServer {
 }
 
 func (ts *TelemetryServer) handleConnection(w http.ResponseWriter, r *http.Request) {
-	// Optional HTTP Basic Auth
+	// Optional HTTP Basic Auth. We also capture the auth-time ISSI here so
+	// the resulting TelemetryClient can be joined to a Station record.
 	clientName := r.URL.Query().Get("name")
+	var authISSI uint32
+	var authCallsign string
 	if user, pass, ok := r.BasicAuth(); ok {
+		fmt.Sscanf(user, "%d", &authISSI)
 		// Verify with RadioID if enabled
 		if ts.svc.radioIDAuth != nil {
-			var issi uint32
-			fmt.Sscanf(user, "%d", &issi)
-			if issi != 0 {
-				callsign, allowed := ts.svc.radioIDAuth.Verify(issi)
+			if authISSI != 0 {
+				callsign, allowed := ts.svc.radioIDAuth.Verify(authISSI)
 				if !allowed {
 					ts.logger.Printf("telemetry: rejected %s (RadioID verification failed)", user)
 					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
 				}
+				authCallsign = callsign
 				if clientName == "" {
 					clientName = callsign
 				}
@@ -117,6 +127,7 @@ func (ts *TelemetryServer) handleConnection(w http.ResponseWriter, r *http.Reque
 	client := &TelemetryClient{
 		Name:         clientName,
 		RemoteIP:     ip,
+		ISSI:         authISSI,
 		Conn:         conn,
 		ConnectedAt:  time.Now(),
 		LastActivity: time.Now(),
@@ -127,7 +138,17 @@ func (ts *TelemetryServer) handleConnection(w http.ResponseWriter, r *http.Reque
 	ts.clients[clientName] = client
 	ts.mu.Unlock()
 
-	ts.logger.Printf("telemetry: client connected name=%s ip=%s", clientName, ip)
+	// Join this telemetry feed to a Station via the registry. ByISSI is the
+	// strong match; callsign fallback covers the case where the operator
+	// already created a station record by callsign but never declared the
+	// ISSI. Auto-create is gated on STATION_AUTO_CREATE.
+	if ts.svc.stationStore != nil && authISSI != 0 {
+		if st, ok := ts.svc.stationStore.LinkOrCreate(authISSI, authCallsign, "bluestation", ts.svc.cfg.Station.AutoCreate); ok {
+			client.StationID = st.StationID
+		}
+	}
+
+	ts.logger.Printf("telemetry: client connected name=%s ip=%s station=%s", clientName, ip, client.StationID)
 
 	defer func() {
 		ts.mu.Lock()
@@ -190,6 +211,8 @@ func (ts *TelemetryServer) handleEvent(client *TelemetryClient, event *Telemetry
 	client.mu.Lock()
 	defer client.mu.Unlock()
 
+	bumpStation := false
+
 	switch {
 	case event.MsRegistration != nil:
 		issi := event.MsRegistration.ISSI
@@ -201,6 +224,7 @@ func (ts *TelemetryServer) handleEvent(client *TelemetryClient, event *Telemetry
 		}
 		client.subscribers[issi].LastSeen = time.Now()
 		ts.logger.Printf("telemetry: %s REGISTER ISSI=%d", client.Name, issi)
+		bumpStation = true
 
 	case event.MsDeregistration != nil:
 		issi := event.MsDeregistration.ISSI
@@ -220,6 +244,7 @@ func (ts *TelemetryServer) handleEvent(client *TelemetryClient, event *Telemetry
 		}
 		client.subscribers[issi].LastSeen = time.Now()
 		ts.logger.Printf("telemetry: %s ATTACH ISSI=%d GSSIs=%v", client.Name, issi, event.MsGroupAttach.GSSIs)
+		bumpStation = true
 
 	case event.MsGroupDetach != nil:
 		issi := event.MsGroupDetach.ISSI
@@ -228,6 +253,10 @@ func (ts *TelemetryServer) handleEvent(client *TelemetryClient, event *Telemetry
 				delete(sub.GSSIs, g)
 			}
 		}
+	}
+
+	if bumpStation && client.StationID != "" && ts.svc.stationStore != nil {
+		ts.svc.stationStore.bumpLastSeen(client.StationID)
 	}
 }
 
@@ -251,6 +280,35 @@ func (ts *TelemetryServer) TotalSubscribers() int {
 		c.mu.RUnlock()
 	}
 	return len(unique)
+}
+
+// TelemetryJoinRow is a thin projection of a telemetry client for the
+// /api/stations join: just the resolved StationID and the live MS ISSIs.
+// Distinct from Snapshot (which is for the admin debug endpoint) because the
+// caller needs typed access, not a free-form map.
+type TelemetryJoinRow struct {
+	StationID   string
+	Subscribers []uint32
+}
+
+// SnapshotForJoin returns one row per connected telemetry client, with the
+// resolved StationID (set by LinkOrCreate at connect) and the live MS ISSIs.
+// Clients that never matched a station (auto-create disabled + no callsign
+// hit) have an empty StationID and are skipped by the caller.
+func (ts *TelemetryServer) SnapshotForJoin() []TelemetryJoinRow {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	out := make([]TelemetryJoinRow, 0, len(ts.clients))
+	for _, c := range ts.clients {
+		c.mu.RLock()
+		issis := make([]uint32, 0, len(c.subscribers))
+		for issi := range c.subscribers {
+			issis = append(issis, issi)
+		}
+		out = append(out, TelemetryJoinRow{StationID: c.StationID, Subscribers: issis})
+		c.mu.RUnlock()
+	}
+	return out
 }
 
 // Snapshot returns info about all connected clients.

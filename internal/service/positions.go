@@ -286,12 +286,13 @@ func (s *Service) handleMapData(w http.ResponseWriter, r *http.Request) {
 	totalSamples, uniqueIssis := s.coverageDB.Stats()
 	devices24h := s.coverageDB.Devices24h()
 
-	// TMO-Site-Stats aus dem stationStore (online = letzter Push < 15 min)
+	// TMO-Site-Stats aus dem stationStore (online = letzter Push < onlineWindow)
 	var sitesOnline, sitesTotal int
 	if s.stationStore != nil {
+		window := s.stationStore.OnlineWindow()
 		for _, st := range s.stationStore.All() {
 			sitesTotal++
-			if st.Online(stationOnlineWindow) {
+			if st.Online(window) {
 				sitesOnline++
 			}
 		}

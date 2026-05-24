@@ -16,15 +16,29 @@ func (s *Service) registerPublicHandlers() {
 func (s *Service) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
 	clients := s.server.SnapshotClients()
 
-	// TMO-site count + subscriber count come from BlueStation telemetry (most accurate).
-	// Falls back to heartbeat API for custom clients.
+	// TMO-site count comes from the unified station registry (any
+	// non-tombstoned station counted as "online" within STATION_ONLINE_WINDOW).
+	// Subscriber count still comes from the live telemetry/heartbeat sources
+	// since the station registry intentionally doesn't hold live MS counts.
 	tmoSiteCount := 0
 	subscriberCount := 0
+	if s.stationStore != nil {
+		window := s.stationStore.OnlineWindow()
+		for _, st := range s.stationStore.All() {
+			if st.Online(window) {
+				tmoSiteCount++
+			}
+		}
+	}
 	if s.telemetry != nil && s.telemetry.ActiveCount() > 0 {
-		tmoSiteCount = s.telemetry.ActiveCount()
+		if tmoSiteCount == 0 {
+			tmoSiteCount = s.telemetry.ActiveCount()
+		}
 		subscriberCount = s.telemetry.TotalSubscribers()
 	} else if s.tmoSites != nil {
-		tmoSiteCount = s.tmoSites.ActiveCount()
+		if tmoSiteCount == 0 {
+			tmoSiteCount = s.tmoSites.ActiveCount()
+		}
 		subscriberCount = s.tmoSites.TotalSubscribers()
 	}
 	_ = clients

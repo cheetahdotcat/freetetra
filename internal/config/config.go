@@ -33,6 +33,7 @@ type Config struct {
 	SIP        SIPConfig
 	Federation FederationConfig
 	Operator   OperatorConfig
+	Station    StationConfig
 }
 
 type OperatorConfig struct {
@@ -94,6 +95,13 @@ type FederationConfig struct {
 	Peers         []string // Peer RPC targets (host:port or URL with host:port)
 	SelfURL       string   // Our own URL for advertising to peers (gossip)
 	RPCListenAddr string   // Local protobuf RPC bind address (e.g. :8092)
+}
+
+type StationConfig struct {
+	OnlineWindow time.Duration // STATION_ONLINE_WINDOW: window in which a push counts as "online" on the map
+	StaleAfter   time.Duration // STATION_STALE_AFTER: how long a soft-deleted (tombstoned) station is retained for federation convergence before local reap
+	ReapInterval time.Duration // STATION_REAP_INTERVAL: how often the background reaper scans
+	AutoCreate   bool          // STATION_AUTO_CREATE: auto-create stub stations when a Brew/Telemetry session presents an ISSI/callsign that doesn't match any existing station
 }
 
 type ServerConfig struct {
@@ -430,6 +438,12 @@ func LoadFromEnv() (Config, error) {
 			Name:        env("OPERATOR_NAME", ""),
 			Contact:     env("OPERATOR_CONTACT", ""),
 			Description: env("OPERATOR_DESCRIPTION", ""),
+		},
+		Station: StationConfig{
+			OnlineWindow: envDuration("STATION_ONLINE_WINDOW", 15*time.Minute),
+			StaleAfter:   envDuration("STATION_STALE_AFTER", 90*24*time.Hour),
+			ReapInterval: envDuration("STATION_REAP_INTERVAL", time.Hour),
+			AutoCreate:   envBool("STATION_AUTO_CREATE", false),
 		},
 		Echo: EchoConfig{
 			Talkgroup:     uint32(envInt("ECHO_TALKGROUP", 10002)),
