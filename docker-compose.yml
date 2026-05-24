@@ -55,3 +55,30 @@ services:
     depends_on:
       - freetetra
     restart: unless-stopped
+
+  soundboard:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-soundboard
+    entrypoint: ["/app/tetra-brew-soundboard"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_SOUNDBOARD_FILE:-.env}
+    environment:
+      BREW_MODE: soundboard
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635721"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      SOUNDBOARD_ENABLED: "true"
+      SOUNDBOARD_LISTEN_ADDR: ":8203"
+      SOUNDBOARD_SOUNDS_DIR: /app/sounds
+      SOUNDBOARD_BREW_ISSI: "899003"
+      SOUNDBOARD_SOURCE_ISSI: "899003"
+      SOUNDBOARD_ENCODER_BIN: /app/tetra-acelp-stdio
+    volumes:
+      - ./sounds:/app/sounds
+    ports:
+      - "8203:8203"
+    depends_on:
+      - freetetra
+    restart: unless-stopped

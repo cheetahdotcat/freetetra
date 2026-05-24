@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>FreeTetra Soundboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0a0d12;
+      --bg-card: #111827;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --text-dim: #9ca3af;
+      --accent: #6ee7b7;
+      --blue: #60a5fa;
+      --red: #f87171;
+    }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; min-height: 100vh; }
+    .shell { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+    h1 { font-size: 1.5rem; font-weight: 700; margin: 0; }
+    h1 span { color: var(--accent); }
+    .status { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; color: var(--text-dim); }
+    .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: middle; }
+    .status.busy .dot { background: var(--red); animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+    .btn {
+      background: var(--bg-card); color: var(--text);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 18px 14px; cursor: pointer; user-select: none;
+      font-size: 0.95rem; font-weight: 600; min-height: 100px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      transition: transform 0.05s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+    .btn .tg { font-family: "JetBrains Mono", monospace; font-size: 0.7rem; color: var(--text-dim); margin-top: 6px; font-weight: 400; }
+    .btn:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .btn:active { transform: scale(0.97); }
+    .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+    .btn.playing { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
+    .btn.uncached { border-style: dashed; }
+    .btn.uncached .tg::before { content: "encoding…  "; color: var(--blue); }
+
+    .empty { color: var(--text-dim); text-align: center; padding: 40px; }
+    .err { color: var(--red); font-size: 0.85rem; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Free<span>Tetra</span> Soundboard</h1>
+      <div id="status" class="status"><span class="dot"></span><span class="text">idle</span></div>
+    </header>
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" style="display:none">No buttons configured. Edit your <code>manifest.json</code> and restart.</div>
+    <div id="err" class="err"></div>
+  </div>
+  <script>
+    const grid = document.getElementById("grid");
+    const empty = document.getElementById("empty");
+    const errEl = document.getElementById("err");
+    const statusEl = document.getElementById("status");
+    let buttons = [];
+    let busy = false;
+    let currentID = "";
+
+    async function loadButtons() {
+      try {
+        const resp = await fetch("/api/buttons");
+        if (!resp.ok) throw new Error("buttons HTTP " + resp.status);
+        const data = await resp.json();
+        buttons = data.buttons || [];
+        renderGrid();
+      } catch (e) {
+        errEl.textContent = "load error: " + e.message;
+      }
+    }
+
+    function renderGrid() {
+      grid.innerHTML = "";
+      if (!buttons.length) {
+        empty.style.display = "";
+        return;
+      }
+      empty.style.display = "none";
+      for (const btn of buttons) {
+        const el = document.createElement("button");
+        el.className = "btn";
+        if (!btn.cached) el.classList.add("uncached");
+        if (btn.color) el.style.background = btn.color;
+        el.innerHTML = `<div>${escape(btn.label || btn.id)}</div><div class="tg">TG ${btn.tg}</div>`;
+        el.addEventListener("click", () => play(btn));
+        el.dataset.id = btn.id;
+        grid.appendChild(el);
+      }
+      applyBusyClass();
+    }
+
+    function escape(s) {
+      const d = document.createElement("div");
+      d.textContent = s == null ? "" : String(s);
+      return d.innerHTML;
+    }
+
+    async function play(btn) {
+      errEl.textContent = "";
+      try {
+        const resp = await fetch("/api/play/" + encodeURIComponent(btn.id), { method: "POST" });
+        if (resp.status === 409) {
+          errEl.textContent = "busy — another sound is playing";
+          return;
+        }
+        if (!resp.ok) {
+          errEl.textContent = "play failed: HTTP " + resp.status;
+          return;
+        }
+        // The server flips busy=true on success; poll picks it up shortly.
+        busy = true;
+        currentID = btn.id;
+        applyBusyClass();
+      } catch (e) {
+        errEl.textContent = "play error: " + e.message;
+      }
+    }
+
+    async function pollState() {
+      try {
+        const resp = await fetch("/api/state");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const newBusy = !!data.busy;
+        const newID = data.current_id || "";
+        if (newBusy !== busy || newID !== currentID) {
+          busy = newBusy;
+          currentID = newID;
+          applyBusyClass();
+          // Cache state may have flipped (first press → cache written).
+          if (!busy) void loadButtons();
+        }
+      } catch {/* swallow */}
+    }
+
+    function applyBusyClass() {
+      statusEl.classList.toggle("busy", busy);
+      statusEl.querySelector(".text").textContent = busy ? ("playing " + currentID) : "idle";
+      for (const el of grid.querySelectorAll(".btn")) {
+        const id = el.dataset.id;
+        el.toggleAttribute("disabled", busy && id !== currentID);
+        el.classList.toggle("playing", busy && id === currentID);
+      }
+    }
+
+    void loadButtons();
+    setInterval(pollState, 500);
+  </script>
+</body>
+</html>

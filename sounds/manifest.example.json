@@ -1,0 +1,24 @@
+{
+  "buttons": [
+    {
+      "id": "horn",
+      "label": "Air Horn",
+      "file": "airhorn.wav",
+      "tg": 10
+    },
+    {
+      "id": "wilhelm",
+      "label": "Wilhelm Scream",
+      "file": "wilhelm.mp3",
+      "tg": 10,
+      "color": "#7c3aed"
+    },
+    {
+      "id": "siren",
+      "label": "Siren",
+      "file": "siren.wav",
+      "tg": 25,
+      "color": "#dc2626"
+    }
+  ]
+}
