@@ -317,6 +317,28 @@ func TestSoundboardBridge_IndexServesEmbeddedHTML(t *testing.T) {
 	}
 }
 
+func TestDurationToFrameCount(t *testing.T) {
+	cases := []struct {
+		d, interval time.Duration
+		want        int
+	}{
+		{0, 60 * time.Millisecond, 0},
+		{-50 * time.Millisecond, 60 * time.Millisecond, 0},
+		{60 * time.Millisecond, 60 * time.Millisecond, 1},
+		{120 * time.Millisecond, 60 * time.Millisecond, 2},
+		{180 * time.Millisecond, 60 * time.Millisecond, 3},
+		{200 * time.Millisecond, 60 * time.Millisecond, 4}, // rounds up
+		{240 * time.Millisecond, 60 * time.Millisecond, 4},
+		{500 * time.Millisecond, 60 * time.Millisecond, 9}, // 8.33 → 9
+		{60 * time.Millisecond, 0, 0},
+	}
+	for _, tc := range cases {
+		if got := durationToFrameCount(tc.d, tc.interval); got != tc.want {
+			t.Errorf("durationToFrameCount(%s, %s) = %d, want %d", tc.d, tc.interval, got, tc.want)
+		}
+	}
+}
+
 func TestSlugify(t *testing.T) {
 	cases := map[string]string{
 		"YIPPEE":                  "yippee",

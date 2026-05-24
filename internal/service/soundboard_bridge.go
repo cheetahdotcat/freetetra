@@ -587,47 +587,114 @@ func (b *SoundboardBridge) writeManifestLocked() error {
 
 // ----- TX path -----
 
+// soundboardSilentFrame is the 36-byte STE frame used for lead-in and
+// tail-out padding around an audio clip. Zero-filled — the TETRA codec
+// decodes this as silence/very-quiet noise; the point is to keep the TX
+// alive on both edges so listeners never get clipped by call setup or
+// teardown delays.
+var soundboardSilentFrame = make([]byte, 36)
+
 func (b *SoundboardBridge) playButton(ctx context.Context, btn SoundboardButton) error {
-	frames, err := b.cachedFrames(ctx, btn)
+	audio, err := b.cachedFrames(ctx, btn)
 	if err != nil {
 		return fmt.Errorf("cached frames: %w", err)
 	}
-	if len(frames) == 0 {
+	if len(audio) == 0 {
 		return fmt.Errorf("no frames for button %q", btn.ID)
 	}
+
+	interval := b.frameInterval()
+	leadInCount := durationToFrameCount(b.cfg.Soundboard.LeadInPadding, interval)
+	tailOutCount := durationToFrameCount(b.cfg.Soundboard.TailOutPadding, interval)
 
 	callID := uuid.New()
 	source := b.sourceISSI()
 	if !b.plane.StartInjectedGroupTX("soundboard", callID, source, btn.TG, 0, 0, 0) {
 		return fmt.Errorf("plane refused StartInjectedGroupTX (call=%s)", callID.String())
 	}
-	b.logger.Printf("soundboard tx start id=%s call=%s tg=%d frames=%d source=%d",
-		btn.ID, callID.String(), btn.TG, len(frames), source)
+	b.logger.Printf("soundboard tx start id=%s call=%s tg=%d audio=%d lead=%d tail=%d source=%d",
+		btn.ID, callID.String(), btn.TG, len(audio), leadInCount, tailOutCount, source)
 
-	interval := b.frameInterval()
-	for i, frame := range frames {
+	release := func() {
+		b.plane.IdleInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
+		b.plane.ReleaseInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
+	}
+
+	// Lead-in silence keeps the TX alive while receivers complete call
+	// setup — without it the first ~100-200ms of audio frequently get
+	// clipped by listeners that haven't fully opened their squelch yet.
+	for i := 0; i < leadInCount; i++ {
+		if err := b.sendFrameWithDelay(ctx, callID, soundboardSilentFrame, interval); err != nil {
+			release()
+			return err
+		}
+	}
+
+	for i, frame := range audio {
 		select {
 		case <-ctx.Done():
-			b.plane.IdleInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
-			b.plane.ReleaseInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
+			release()
 			return ctx.Err()
 		default:
 		}
 		b.plane.InjectedVoiceFrame("soundboard", callID, frame)
-		if interval > 0 && i < len(frames)-1 {
+		if interval > 0 && (i < len(audio)-1 || tailOutCount > 0) {
 			select {
 			case <-ctx.Done():
-				b.plane.IdleInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
-				b.plane.ReleaseInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
+				release()
 				return ctx.Err()
 			case <-time.After(interval):
 			}
 		}
 	}
-	b.plane.IdleInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
-	b.plane.ReleaseInjectedCall("soundboard", callID, b.cfg.Soundboard.ReleaseCause)
+
+	// Tail-out silence: the receiver's last decoded frame keeps playing until
+	// the next one arrives, so without padding the very end of the audio gets
+	// chopped when the call teardown reaches the radio.
+	for i := 0; i < tailOutCount; i++ {
+		if err := b.sendFrameWithDelay(ctx, callID, soundboardSilentFrame, interval); err != nil {
+			release()
+			return err
+		}
+	}
+
+	release()
 	b.logger.Printf("soundboard tx end id=%s call=%s", btn.ID, callID.String())
 	return nil
+}
+
+// sendFrameWithDelay enqueues one frame and then waits `interval`, with
+// ctx cancellation honored on both halves. Used by the padding loops where
+// every iteration is uniform.
+func (b *SoundboardBridge) sendFrameWithDelay(ctx context.Context, callID uuid.UUID, frame []byte, interval time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	b.plane.InjectedVoiceFrame("soundboard", callID, frame)
+	if interval <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(interval):
+		return nil
+	}
+}
+
+// durationToFrameCount rounds a configured padding duration up to a whole
+// number of frames at the given cadence. Zero or negative padding → 0.
+func durationToFrameCount(d, interval time.Duration) int {
+	if d <= 0 || interval <= 0 {
+		return 0
+	}
+	n := int(d / interval)
+	if d%interval != 0 {
+		n++
+	}
+	return n
 }
 
 func (b *SoundboardBridge) sourceISSI() uint32 {

@@ -218,6 +218,8 @@ type SoundboardConfig struct {
 	EncoderArgs      string
 	EncoderFrameSize int
 	FrameInterval    time.Duration
+	LeadInPadding    time.Duration // silent padding emitted before the audio
+	TailOutPadding   time.Duration // silent padding emitted after the audio
 	ReconnectDelay   time.Duration
 	ReleaseCause     uint8
 }
@@ -407,6 +409,8 @@ func LoadFromEnv() (Config, error) {
 			EncoderArgs:      env("SOUNDBOARD_ENCODER_ARGS", ""),
 			EncoderFrameSize: envInt("SOUNDBOARD_ENCODER_FRAME_SIZE", 18),
 			FrameInterval:    envDuration("SOUNDBOARD_FRAME_INTERVAL", 60*time.Millisecond),
+			LeadInPadding:    envDuration("SOUNDBOARD_LEAD_IN", 240*time.Millisecond),
+			TailOutPadding:   envDuration("SOUNDBOARD_TAIL_OUT", 240*time.Millisecond),
 			ReconnectDelay:   envDuration("SOUNDBOARD_RECONNECT_DELAY", 3*time.Second),
 			ReleaseCause:     uint8(envInt("SOUNDBOARD_RELEASE_CAUSE", 0)),
 		},
