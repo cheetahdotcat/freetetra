@@ -56,10 +56,14 @@ services:
       - freetetra
     restart: unless-stopped
 
+  # Opt-in app. Bring it up explicitly with:
+  #   docker compose --profile soundboard up -d soundboard
+  # Default `docker compose up` skips it so the base stack stays minimal.
   soundboard:
     build: .
     image: freetetra:latest
     container_name: freetetra-soundboard
+    profiles: ["soundboard"]
     entrypoint: ["/app/tetra-brew-soundboard"]
     env_file:
       - ${ENV_COMMON_FILE:-.env}
