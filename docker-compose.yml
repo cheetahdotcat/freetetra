@@ -56,6 +56,33 @@ services:
       - freetetra
     restart: unless-stopped
 
+  # Optional DMR/BrandMeister bridge for TG 91+. Disabled unless an env file
+  # (typically .env.dmrbridge) provides DMRBRIDGE_BM_USER + DMRBRIDGE_BM_PASS.
+  # Start with: docker compose --profile dmrbridge up -d dmrbridge
+  #
+  # Gate: only source ISSIs that exist in the local RadioID users.txt may
+  # transmit into BrandMeister. Everyone else stays listen-only on TG 91+.
+  # Disable the gate with DMRBRIDGE_REQUIRE_RADIOID=false in the env file.
+  dmrbridge:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-dmrbridge
+    entrypoint: ["/app/tetra-brew-dmrbridge"]
+    profiles: ["dmrbridge"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_DMRBRIDGE_FILE:-.env.dmrbridge}
+    environment:
+      DMRBRIDGE_FT_BASE_URL: http://freetetra:8101
+      DMRBRIDGE_BM_BASE_URL: https://core.tetrapack.online:443
+      # Default whitelist: Worldwide + DL-cluster + Echo + alle 16 DL-Bundeslaender
+      # + Hamburg-City (26221) + CCC Chaos Wellen (26223) + Hamburg C4FM/YSF Bridge (26421).
+      # Override im .env.dmrbridge wenn du andere TGs willst.
+      DMRBRIDGE_TGS: "91,262,2621,2622,2623,2624,9990,26201,26202,26203,26204,26205,26206,26207,26208,26209,26210,26211,26212,26213,26214,26215,26216,26221,26223,26421"
+      DMRBRIDGE_REQUIRE_RADIOID: "true"
+      RADIOID_USERS_FILE: /app/data/users.txt
+    volumes:
+      - ./data:/app/data:ro
   # Side-by-side preprocessing test rig on TG 17. Built from the same image
   # as the live webradio, but with every new WEBRADIO_* knob from
   # feat/webradio-preprocessing turned on so we can A/B against TG 10.
