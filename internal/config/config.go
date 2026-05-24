@@ -156,6 +156,57 @@ type WebRadioConfig struct {
 	EncoderFrameSize int
 	ReconnectDelay   time.Duration
 	ReleaseCause     uint8
+
+	// Pre-processing filter chain knobs. Composed into ffmpeg's -af value
+	// by BuildWebRadioFilterChain; left at the legacy defaults this
+	// reproduces the previous hardcoded "volume=-14dB,acompressor=..." chain.
+	VolumeDB     float64
+	Compressor   string
+	ExtraFilters string
+
+	// Speech-band shaping. HPF/LPF in Hz; 0 disables that stage.
+	// Recommended values for narrowband ACELP: HPF 120 (kill rumble),
+	// LPF 3500 (codec ceiling).
+	HPFHz int
+	LPFHz int
+
+	// Resampler picks ffmpeg's aresample backend ("" → default, "soxr" →
+	// higher-quality SoX-style downsampling). Applied at the end of the
+	// chain so it sees the final, processed signal.
+	Resampler string
+
+	// Loudness normalization (EBU R128 via ffmpeg's loudnorm filter).
+	// LoudnormMode: "off" (default — keep legacy static volume behavior)
+	// or "single" (single-pass live normalization, ~3s look-ahead).
+	LoudnormMode string
+	LoudnormI    float64 // integrated loudness target LUFS; default -16
+	LoudnormTP   float64 // true-peak ceiling dBTP; default -1.5
+	LoudnormLRA  float64 // loudness range LU; default 11
+
+	// LimiterDBFS sets a soft brickwall just before the encoder. Negative
+	// → ceiling in dBFS (e.g. -0.5 ≈ 0.944 linear). Zero/positive disables.
+	LimiterDBFS float64
+
+	// Silence detection (uses ffmpeg's silencedetect filter). When on, the
+	// bridge parses silence_start/silence_end events from ffmpeg stderr
+	// and exposes the current Silence flag via /api/webradio/status.
+	// Silence-aware TX gating in task 6 reads from the same state.
+	Silencedetect    bool
+	SilenceNoiseDB   int           // -dB threshold for "silence"; default -50
+	SilenceMinDur    time.Duration // minimum run before silence_start fires; default 1.5s
+	SilenceGating    bool          // when true, drop frames + idle the call while silence holds
+
+	// ListenAddr enables a small HTTP server inside the webradio binary.
+	// Empty → no server (legacy behavior). When set, serves /api/webradio/status.
+	ListenAddr        string
+	TelemetryLogEvery time.Duration // periodic summary log cadence; default 30s
+
+	// Sources is the ordered failover list. Empty → [StreamURL] (legacy
+	// single-source compatibility). StallTimeout > 0 enables a watchdog
+	// that rotates to the next source if no frames have arrived for the
+	// given duration; 0 disables the watchdog.
+	Sources      []string
+	StallTimeout time.Duration
 }
 
 type ZelloConfig struct {
@@ -272,6 +323,25 @@ func LoadFromEnv() (Config, error) {
 			EncoderFrameSize: envInt("WEBRADIO_ENCODER_FRAME_SIZE", 18),
 			ReconnectDelay:   envDuration("WEBRADIO_RECONNECT_DELAY", 3*time.Second),
 			ReleaseCause:     uint8(envInt("WEBRADIO_RELEASE_CAUSE", 0)),
+			VolumeDB:         envFloat("WEBRADIO_VOLUME_DB", -14),
+			Compressor:       env("WEBRADIO_COMPRESSOR", "acompressor=threshold=-20dB:ratio=4:attack=5:release=50"),
+			ExtraFilters:     env("WEBRADIO_EXTRA_FILTERS", ""),
+			HPFHz:            envInt("WEBRADIO_HPF_HZ", 0),
+			LPFHz:            envInt("WEBRADIO_LPF_HZ", 0),
+			Resampler:        env("WEBRADIO_RESAMPLER", ""),
+			LoudnormMode:     env("WEBRADIO_LOUDNORM_MODE", "off"),
+			LoudnormI:        envFloat("WEBRADIO_LOUDNORM_I", -16),
+			LoudnormTP:       envFloat("WEBRADIO_LOUDNORM_TP", -1.5),
+			LoudnormLRA:      envFloat("WEBRADIO_LOUDNORM_LRA", 11),
+			LimiterDBFS:      envFloat("WEBRADIO_LIMITER_DBFS", 0),
+			Silencedetect:    envBool("WEBRADIO_SILENCEDETECT", false),
+			SilenceNoiseDB:   envInt("WEBRADIO_SILENCE_NOISE_DB", -50),
+			SilenceMinDur:    envDuration("WEBRADIO_SILENCE_MIN_DUR", 1500*time.Millisecond),
+			SilenceGating:    envBool("WEBRADIO_SILENCE_GATING", false),
+			ListenAddr:       env("WEBRADIO_LISTEN_ADDR", ""),
+			TelemetryLogEvery: envDuration("WEBRADIO_TELEMETRY_LOG_EVERY", 30*time.Second),
+			Sources:          envCSV("WEBRADIO_SOURCES"),
+			StallTimeout:     envDuration("WEBRADIO_STALL_TIMEOUT", 0),
 		},
 		Zello: ZelloConfig{
 			Enabled:          envBool("ZELLO_ENABLED", false),
@@ -443,6 +513,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envFloat(key string, fallback float64) float64 {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 	if err != nil {
 		return fallback
 	}

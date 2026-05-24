@@ -3,13 +3,16 @@ package service
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,14 +25,27 @@ type WebRadioBridge struct {
 	logger *log.Logger
 	plane  InjectionPlane
 
+	telemetry *webradioTelemetry
+	rotator   *sourceRotator
+	muted     atomic.Bool
+
 	mu     sync.Mutex
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	server *http.Server // optional, started when cfg.WebRadio.ListenAddr is set
+
+	// sessionCancel is set by runSession to its own CancelCauseFunc. Skip /
+	// Reload call it with a sentinel cause to tear the current ffmpeg +
+	// encoder pair down, which runLoop then interprets via the cause.
+	sessionMu     sync.Mutex
+	sessionCancel context.CancelCauseFunc
+
+	wg sync.WaitGroup
 }
 
 func NewWebRadioBridge(cfg config.Config, logger *log.Logger, plane InjectionPlane) (*WebRadioBridge, error) {
-	if strings.TrimSpace(cfg.WebRadio.StreamURL) == "" {
-		return nil, fmt.Errorf("WEBRADIO_STREAM_URL is required when WEBRADIO_ENABLED=true")
+	rotator := newSourceRotator(cfg.WebRadio)
+	if rotator.Len() == 0 {
+		return nil, fmt.Errorf("WEBRADIO_STREAM_URL or WEBRADIO_SOURCES must be set when WEBRADIO_ENABLED=true")
 	}
 	if cfg.WebRadio.Talkgroup == 0 {
 		return nil, fmt.Errorf("WEBRADIO_TALKGROUP must be > 0 when WEBRADIO_ENABLED=true")
@@ -41,11 +57,48 @@ func NewWebRadioBridge(cfg config.Config, logger *log.Logger, plane InjectionPla
 		return nil, fmt.Errorf("WEBRADIO_ENCODER_BIN is required")
 	}
 	return &WebRadioBridge{
-		cfg:    cfg,
-		logger: logger,
-		plane:  plane,
+		cfg:       cfg,
+		logger:    logger,
+		plane:     plane,
+		telemetry: &webradioTelemetry{},
+		rotator:   rotator,
 	}, nil
 }
+
+// Telemetry exposes the live observability state for the status endpoint
+// and (in task 6) the silence-aware TX gate.
+func (b *WebRadioBridge) Telemetry() *webradioTelemetry { return b.telemetry }
+
+// Skip tears the current session down with errManualSkip so runLoop rotates
+// to the next source without applying the usual reconnect delay. No-op if
+// no session is active.
+func (b *WebRadioBridge) Skip() {
+	b.sessionMu.Lock()
+	cancel := b.sessionCancel
+	b.sessionMu.Unlock()
+	if cancel != nil {
+		cancel(errManualSkip)
+	}
+}
+
+// Reload tears the current session down with errManualReload so runLoop
+// restarts ffmpeg + encoder against the same source URL (no rotation).
+// Useful to pick up env changes or shake out a wedged downstream.
+func (b *WebRadioBridge) Reload() {
+	b.sessionMu.Lock()
+	cancel := b.sessionCancel
+	b.sessionMu.Unlock()
+	if cancel != nil {
+		cancel(errManualReload)
+	}
+}
+
+// Mute stops the bridge from injecting voice frames. The ffmpeg + encoder
+// pair keeps running so loudnorm doesn't have to reconverge when unmuted;
+// the frame loop just drops frames and idles any active call.
+func (b *WebRadioBridge) Mute()   { b.muted.Store(true) }
+func (b *WebRadioBridge) Unmute() { b.muted.Store(false) }
+func (b *WebRadioBridge) Muted() bool { return b.muted.Load() }
 
 func (b *WebRadioBridge) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
@@ -61,25 +114,111 @@ func (b *WebRadioBridge) Start(ctx context.Context) error {
 	b.mu.Unlock()
 
 	b.logger.Printf(
-		"webradio bridge enabled stream=%s tg=%d source=%d encoder=%s frame_size=%d reconnect=%s",
-		b.cfg.WebRadio.StreamURL,
+		"webradio bridge enabled sources=%d active=%s tg=%d source=%d encoder=%s frame_size=%d reconnect=%s stall_timeout=%s",
+		b.rotator.Len(),
+		b.rotator.Current(),
 		b.cfg.WebRadio.Talkgroup,
 		b.cfg.WebRadio.SourceISSI,
 		b.cfg.WebRadio.EncoderBin,
 		b.encoderFrameSize(),
 		b.reconnectDelay().String(),
+		b.cfg.WebRadio.StallTimeout.String(),
 	)
 
 	go b.runLoop(runCtx)
+	b.maybeStartHTTPServer()
+	b.maybeStartTelemetryLogger(runCtx)
 	return nil
+}
+
+// maybeStartHTTPServer brings up a small status server if ListenAddr is set.
+// Failures are logged but don't break the audio pipeline — the operator gets
+// a degraded experience (no /api/webradio/status), not a dead container.
+func (b *WebRadioBridge) maybeStartHTTPServer() {
+	addr := strings.TrimSpace(b.cfg.WebRadio.ListenAddr)
+	if addr == "" {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/webradio/status", b.handleStatus)
+	mux.HandleFunc("/api/webradio/skip", b.handleControl(func() { b.Skip() }))
+	mux.HandleFunc("/api/webradio/reload", b.handleControl(func() { b.Reload() }))
+	mux.HandleFunc("/api/webradio/mute", b.handleControl(func() { b.Mute() }))
+	mux.HandleFunc("/api/webradio/unmute", b.handleControl(func() { b.Unmute() }))
+	srv := &http.Server{Addr: addr, Handler: mux}
+	b.mu.Lock()
+	b.server = srv
+	b.mu.Unlock()
+	go func() {
+		b.logger.Printf("webradio status server listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			b.logger.Printf("webradio status server error: %v", err)
+		}
+	}()
+}
+
+func (b *WebRadioBridge) handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	snap := b.telemetry.Snapshot()
+	resp := map[string]any{
+		"telemetry":      snap,
+		"muted":          b.muted.Load(),
+		"current_source": b.rotator.Current(),
+		"sources":        b.rotator.Len(),
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleControl wraps a side-effect-only action into a POST handler that
+// returns the post-action status snapshot. Used for skip / reload / mute /
+// unmute so a single curl call both triggers and confirms.
+func (b *WebRadioBridge) handleControl(action func()) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		action()
+		b.handleStatus(w, r)
+	}
+}
+
+// maybeStartTelemetryLogger emits a one-line summary every
+// TelemetryLogEvery (default 30s). Skips if the cadence is zero.
+func (b *WebRadioBridge) maybeStartTelemetryLogger(ctx context.Context) {
+	every := b.cfg.WebRadio.TelemetryLogEvery
+	if every <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snap := b.telemetry.Snapshot()
+				b.logger.Printf("webradio telemetry silence=%t silence_dur=%.2fs",
+					snap.Silence, snap.SilenceDur)
+			}
+		}
+	}()
 }
 
 func (b *WebRadioBridge) Stop() {
 	b.mu.Lock()
 	cancel := b.cancel
+	srv := b.server
 	b.cancel = nil
+	b.server = nil
 	b.mu.Unlock()
 
+	if srv != nil {
+		shutdownCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = srv.Shutdown(shutdownCtx)
+		c()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -95,8 +234,25 @@ func (b *WebRadioBridge) runLoop(ctx context.Context) {
 		}
 
 		err := b.runSession(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		stalled := errors.Is(err, errStallTimeout)
+		skipped := errors.Is(err, errManualSkip)
+		reloaded := errors.Is(err, errManualReload)
+		if err != nil && !errors.Is(err, context.Canceled) && !skipped && !reloaded {
 			b.logger.Printf("webradio session error: %v", err)
+		}
+
+		// Stall + manual skip both rotate without the reconnect delay. Stall
+		// means the current source died; manual skip means the operator
+		// asked. Single-source deployments stall back onto themselves.
+		if (stalled || skipped) && b.rotator.Len() > 1 {
+			next := b.rotator.Skip()
+			b.logger.Printf("webradio failover: %v → next source %s", err, next)
+			continue
+		}
+		// Manual reload restarts the same source immediately.
+		if reloaded {
+			b.logger.Printf("webradio: manual reload requested, restarting source %s", b.rotator.Current())
+			continue
 		}
 
 		select {
@@ -107,11 +263,64 @@ func (b *WebRadioBridge) runLoop(ctx context.Context) {
 	}
 }
 
+// watchStall closes the cancel function with errStallTimeout when no frame
+// has arrived for cfg.WebRadio.StallTimeout. lastFrameTime is read via the
+// pointer and atomicity isn't required — the watchdog only cares about
+// monotonic age, and runSession blocks on I/O between updates.
+func (b *WebRadioBridge) watchStall(ctx context.Context, lastFrameTime *time.Time, lastFrameMu *sync.Mutex, cancelWithCause func(error)) {
+	timeout := b.cfg.WebRadio.StallTimeout
+	if timeout <= 0 {
+		return
+	}
+	tick := timeout / 2
+	if tick < 500*time.Millisecond {
+		tick = 500 * time.Millisecond
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			lastFrameMu.Lock()
+			age := time.Since(*lastFrameTime)
+			lastFrameMu.Unlock()
+			if age > timeout {
+				b.logger.Printf("webradio stall watchdog: no frames for %.1fs (limit %s)", age.Seconds(), timeout)
+				cancelWithCause(errStallTimeout)
+				return
+			}
+		}
+	}
+}
+
 func (b *WebRadioBridge) runSession(ctx context.Context) error {
 	callID := uuid.New()
 
-	ffmpegCmd := exec.CommandContext(ctx, b.cfg.WebRadio.FFmpegBin, b.ffmpegArgs()...)
-	encoderCmd := exec.CommandContext(ctx, b.cfg.WebRadio.EncoderBin, b.encoderArgs()...)
+	// Wrap with WithCancelCause so the stall watchdog can communicate
+	// "this source died" upward without using a side channel. The cause is
+	// recovered below and turned into errStallTimeout for the outer loop.
+	sessCtx, cancelSession := context.WithCancelCause(ctx)
+	defer cancelSession(nil)
+
+	// Expose the cancel func so external triggers (Skip / Reload) can tear
+	// the session down with a sentinel cause. Cleared on return.
+	b.sessionMu.Lock()
+	b.sessionCancel = cancelSession
+	b.sessionMu.Unlock()
+	defer func() {
+		b.sessionMu.Lock()
+		b.sessionCancel = nil
+		b.sessionMu.Unlock()
+	}()
+
+	var lastFrameMu sync.Mutex
+	lastFrameTime := time.Now()
+	go b.watchStall(sessCtx, &lastFrameTime, &lastFrameMu, cancelSession)
+
+	ffmpegCmd := exec.CommandContext(sessCtx, b.cfg.WebRadio.FFmpegBin, b.ffmpegArgs()...)
+	encoderCmd := exec.CommandContext(sessCtx, b.cfg.WebRadio.EncoderBin, b.encoderArgs()...)
 
 	ffmpegOut, err := ffmpegCmd.StdoutPipe()
 	if err != nil {
@@ -154,8 +363,8 @@ func (b *WebRadioBridge) runSession(ctx context.Context) error {
 		copyErrCh <- copyErr
 	}()
 
-	activeCallID, callStarted, readErr := b.readEncoderFrames(ctx, callID, encoderOut)
-	if readErr != nil && ctx.Err() == nil {
+	activeCallID, callStarted, readErr := b.readEncoderFrames(sessCtx, callID, encoderOut, &lastFrameTime, &lastFrameMu)
+	if readErr != nil && sessCtx.Err() == nil {
 		if ffmpegCmd.Process != nil {
 			_ = ffmpegCmd.Process.Kill()
 		}
@@ -171,8 +380,21 @@ func (b *WebRadioBridge) runSession(ctx context.Context) error {
 		b.plane.ReleaseInjectedCall("webradio", activeCallID, b.cfg.WebRadio.ReleaseCause)
 	}
 
+	// Distinguish parent-cancel (Stop) from stall-cancel (watchdog). The
+	// parent ctx error wins because that's the user actually asking us to
+	// stop; a stall in flight when Stop fires is irrelevant.
 	if ctx.Err() != nil {
 		return context.Canceled
+	}
+	if cause := context.Cause(sessCtx); cause != nil {
+		switch {
+		case errors.Is(cause, errStallTimeout):
+			return errStallTimeout
+		case errors.Is(cause, errManualSkip):
+			return errManualSkip
+		case errors.Is(cause, errManualReload):
+			return errManualReload
+		}
 	}
 
 	// Log detailed diagnostics when session fails
@@ -195,7 +417,7 @@ func (b *WebRadioBridge) runSession(ctx context.Context) error {
 	return nil
 }
 
-func (b *WebRadioBridge) readEncoderFrames(ctx context.Context, callID uuid.UUID, r io.Reader) (uuid.UUID, bool, error) {
+func (b *WebRadioBridge) readEncoderFrames(ctx context.Context, callID uuid.UUID, r io.Reader, lastFrameTime *time.Time, lastFrameMu *sync.Mutex) (uuid.UUID, bool, error) {
 	reader := bufio.NewReader(r)
 	frameSize := b.encoderFrameSize()
 	frame := make([]byte, frameSize)
@@ -204,7 +426,6 @@ func (b *WebRadioBridge) readEncoderFrames(ctx context.Context, callID uuid.UUID
 	activeCallID := uuid.Nil
 	callStarted := false
 	frameInCall := 0
-	lastFrameTime := time.Now()
 
 	for {
 		if ctx.Err() != nil {
@@ -218,23 +439,57 @@ func (b *WebRadioBridge) readEncoderFrames(ctx context.Context, callID uuid.UUID
 				}
 				return activeCallID, callStarted, nil
 			}
-			b.logger.Printf("webradio session %s: frame read failed after %v: %v", callID.String()[:8], time.Since(lastFrameTime), err)
+			lastFrameMu.Lock()
+			age := time.Since(*lastFrameTime)
+			lastFrameMu.Unlock()
+			b.logger.Printf("webradio session %s: frame read failed after %v: %v", callID.String()[:8], age, err)
 			return activeCallID, callStarted, err
 		}
 
-		// Monitor time between frames to detect stalls
+		// Stamp the shared lastFrameTime so the stall watchdog can see
+		// whether the source is still feeding us.
 		now := time.Now()
-		timeSinceLastFrame := now.Sub(lastFrameTime)
-		if timeSinceLastFrame > 5*time.Second {
-			b.logger.Printf("webradio session %s: frame stall detected (%.1fs since last frame)", callID.String()[:8], timeSinceLastFrame.Seconds())
-		}
-		lastFrameTime = now
+		lastFrameMu.Lock()
+		*lastFrameTime = now
+		lastFrameMu.Unlock()
 
 		ste, ready, err := normalizeRadioFrame(frame, &pendingCodec18)
 		if err != nil {
 			return activeCallID, callStarted, err
 		}
 		if !ready {
+			continue
+		}
+
+		// Mute gating works the same way: drop frames + idle the call so
+		// receivers don't sit on a held carrier. Mute is operator-driven,
+		// independent of any silence-detection state.
+		if b.muted.Load() {
+			if callStarted {
+				b.plane.IdleInjectedCall("webradio", currentCallID, b.cfg.WebRadio.ReleaseCause)
+				b.logger.Printf("webradio mute gate: idled call=%s", currentCallID.String())
+				callStarted = false
+				activeCallID = uuid.Nil
+				currentCallID = uuid.New()
+				frameInCall = 0
+			}
+			continue
+		}
+
+		// Silence-aware gating: while the parser reports silence, release
+		// any active call and drop incoming frames. The next non-silent
+		// frame falls through to the "!callStarted" branch below and
+		// allocates a fresh callID, so receivers see a clean stop/start
+		// instead of dead air being held on the TG.
+		if b.cfg.WebRadio.SilenceGating && b.telemetry != nil && b.telemetry.IsSilent() {
+			if callStarted {
+				b.plane.IdleInjectedCall("webradio", currentCallID, b.cfg.WebRadio.ReleaseCause)
+				b.logger.Printf("webradio silence gate: idled call=%s", currentCallID.String())
+				callStarted = false
+				activeCallID = uuid.Nil
+				currentCallID = uuid.New()
+				frameInCall = 0
+			}
 			continue
 		}
 
@@ -323,10 +578,20 @@ func packCodecBitsToSTE(bits []byte) []byte {
 
 func (b *WebRadioBridge) logCommandOutput(prefix string, r io.Reader) {
 	sc := bufio.NewScanner(r)
+	// ffmpeg can emit long status lines (e.g. silencedetect spam under heavy
+	// dynamics); bump the per-token buffer above bufio's 64 KiB default so
+	// the scanner doesn't bail with ErrTooLong.
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
+		}
+		// Tee through the telemetry parser before logging. Recognized lines
+		// still go through the logger — visibility matters more than the
+		// few bytes of duplication.
+		if b.telemetry != nil {
+			_ = b.telemetry.ParseLine(line)
 		}
 		b.logger.Printf("%s: %s", prefix, line)
 	}
@@ -338,13 +603,17 @@ func (b *WebRadioBridge) ffmpegArgs() []string {
 		"-nostdin",
 		"-hide_banner",
 		"-loglevel", "error",
-		"-i", b.cfg.WebRadio.StreamURL,
-		"-af", "volume=-14dB,acompressor=threshold=-20dB:ratio=4:attack=5:release=50",
+		"-i", b.rotator.Current(),
+	}
+	if chain := BuildWebRadioFilterChain(b.cfg.WebRadio); chain != "" {
+		args = append(args, "-af", chain)
+	}
+	args = append(args,
 		"-f", "s16le",
 		"-ac", "1",
 		"-ar", "8000",
 		"pipe:1",
-	}
+	)
 	return args
 }
 

@@ -55,3 +55,50 @@ services:
     depends_on:
       - freetetra
     restart: unless-stopped
+
+  # Side-by-side preprocessing test rig on TG 17. Built from the same image
+  # as the live webradio, but with every new WEBRADIO_* knob from
+  # feat/webradio-preprocessing turned on so we can A/B against TG 10.
+  # Bring up explicitly with:
+  #   docker compose --profile webradio-test up -d --build webradio-test
+  webradio-test:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-webradio-test
+    profiles: ["webradio-test"]
+    entrypoint: ["/app/tetra-brew-webradio"]
+    environment:
+      BREW_MODE: webradio
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635718"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      WEBRADIO_ENABLED: "true"
+      # Two sources so the stall watchdog has somewhere to fail over to.
+      WEBRADIO_SOURCES: "https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3,https://st02.sslstream.dlf.de/dlf/02/128/mp3/stream.mp3"
+      WEBRADIO_TALKGROUP: "17"
+      WEBRADIO_SOURCE_ISSI: "124"
+      WEBRADIO_ENCODER_BIN: /app/tetra-acelp-stdio
+      WEBRADIO_RECONNECT_DELAY: "5s"
+
+      # Preprocessing pipeline
+      WEBRADIO_VOLUME_DB: "0"               # let loudnorm handle level
+      WEBRADIO_LOUDNORM_MODE: single
+      WEBRADIO_LOUDNORM_I: "-16"
+      WEBRADIO_LOUDNORM_TP: "-1.5"
+      WEBRADIO_LOUDNORM_LRA: "11"
+      WEBRADIO_HPF_HZ: "120"
+      WEBRADIO_LPF_HZ: "3500"
+      WEBRADIO_RESAMPLER: soxr
+      WEBRADIO_LIMITER_DBFS: "-0.5"
+
+      # Telemetry + control
+      WEBRADIO_LISTEN_ADDR: ":8204"
+      WEBRADIO_SILENCEDETECT: "true"
+      WEBRADIO_SILENCE_GATING: "true"
+      WEBRADIO_STALL_TIMEOUT: "10s"
+      WEBRADIO_TELEMETRY_LOG_EVERY: "15s"
+    ports:
+      - "8204:8204"
+    depends_on:
+      - freetetra
+    restart: unless-stopped

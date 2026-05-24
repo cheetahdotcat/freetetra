@@ -1,6 +1,93 @@
 package service
 
-import "testing"
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/freetetra/server/internal/config"
+)
+
+func newWebRadioBridgeForControl(t *testing.T, sources []string) *WebRadioBridge {
+	t.Helper()
+	cfg := config.Config{}
+	cfg.WebRadio = config.WebRadioConfig{
+		Sources:    sources,
+		Talkgroup:  10,
+		FFmpegBin:  "ffmpeg",
+		EncoderBin: "tetra-acelp-stdio",
+	}
+	logger := log.New(io.Discard, "", 0)
+	bridge, err := NewWebRadioBridge(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("NewWebRadioBridge: %v", err)
+	}
+	return bridge
+}
+
+func TestWebRadioControl_MuteUnmuteFlag(t *testing.T) {
+	b := newWebRadioBridgeForControl(t, []string{"https://a/", "https://b/"})
+	if b.Muted() {
+		t.Fatalf("fresh bridge should not be muted")
+	}
+	b.Mute()
+	if !b.Muted() {
+		t.Errorf("Muted() should report true after Mute()")
+	}
+	b.Unmute()
+	if b.Muted() {
+		t.Errorf("Muted() should report false after Unmute()")
+	}
+}
+
+func TestWebRadioControl_SkipNoSessionIsNoop(t *testing.T) {
+	// Skip with no live session must not panic — sessionCancel is nil
+	// before runSession runs.
+	b := newWebRadioBridgeForControl(t, []string{"https://a/"})
+	b.Skip()
+	b.Reload()
+}
+
+func TestWebRadioControl_HandleStatusReportsState(t *testing.T) {
+	b := newWebRadioBridgeForControl(t, []string{"https://primary/", "https://backup/"})
+	b.Mute()
+
+	rec := httptest.NewRecorder()
+	b.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/api/webradio/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if resp["muted"] != true {
+		t.Errorf("muted = %v, want true", resp["muted"])
+	}
+	if resp["current_source"] != "https://primary/" {
+		t.Errorf("current_source = %v, want primary", resp["current_source"])
+	}
+	if got, _ := resp["sources"].(float64); int(got) != 2 {
+		t.Errorf("sources count = %v, want 2", resp["sources"])
+	}
+}
+
+func TestWebRadioControl_HandleControlRejectsGET(t *testing.T) {
+	b := newWebRadioBridgeForControl(t, []string{"https://a/"})
+	h := b.handleControl(b.Mute)
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/api/webradio/mute", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status %d, want 405", rec.Code)
+	}
+	if b.Muted() {
+		t.Errorf("Mute action must not have run on rejected request")
+	}
+}
+
 
 func TestNormalizeRadioFramePairs18ByteCodecFrames(t *testing.T) {
 	var pending []byte
