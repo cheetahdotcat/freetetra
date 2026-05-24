@@ -128,50 +128,92 @@ func newTestSoundboardBridge(t *testing.T, dir string, buttons []SoundboardButto
 	return bridge
 }
 
-func TestSoundboardBridge_PlayRejectsSecondPressWhileBusy(t *testing.T) {
+func TestSoundboardBridge_SecondPressSameButtonStops(t *testing.T) {
 	dir := t.TempDir()
 	btn := SoundboardButton{ID: "ping", Label: "Ping", File: "ping.wav", TG: 10}
 	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{btn})
 
-	// Prime the cache so playButton doesn't try to spawn ffmpeg.
-	primeCache(t, bridge.sourcePath(btn), 30)
-
-	// First press: should accept (started). We deliberately use a slow frame
-	// interval via config so the play stays in-flight long enough for the
-	// second press to observe busy=true.
+	primeCache(t, bridge.sourcePath(btn), 200) // 200 frames * 50ms = ~10s of audio
 	bridge.cfg.Soundboard.FrameInterval = 50 * time.Millisecond
+	bridge.cfg.Soundboard.LeadInPadding = 0
+	bridge.cfg.Soundboard.TailOutPadding = 0
 
-	req1 := httptest.NewRequest(http.MethodPost, "/api/play/ping", nil)
-	rec1 := httptest.NewRecorder()
-	bridge.handlePlay(rec1, req1)
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("first press: status %d body=%s", rec1.Code, rec1.Body.String())
+	// First press → starts.
+	rec := httptest.NewRecorder()
+	bridge.handlePlay(rec, httptest.NewRequest(http.MethodPost, "/api/play/ping", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first press: status %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// Give the goroutine a moment to flip busy=true before the second press.
+	// Wait for busy=true.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) && !bridge.busy.Load() {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if !bridge.busy.Load() {
-		t.Fatalf("expected bridge busy after first press")
+		t.Fatalf("expected busy after first press")
 	}
 
-	req2 := httptest.NewRequest(http.MethodPost, "/api/play/ping", nil)
-	rec2 := httptest.NewRecorder()
-	bridge.handlePlay(rec2, req2)
-	if rec2.Code != http.StatusConflict {
-		t.Fatalf("second press: status %d body=%s — want 409", rec2.Code, rec2.Body.String())
+	// Second press on the same id → stop (200 with stopped field).
+	rec = httptest.NewRecorder()
+	bridge.handlePlay(rec, httptest.NewRequest(http.MethodPost, "/api/play/ping", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop press: status %d body=%s — want 200", rec.Code, rec.Body.String())
+	}
+	var stopResp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &stopResp)
+	if stopResp["stopped"] != "ping" {
+		t.Errorf("stop response: want stopped=ping, got %v", stopResp)
 	}
 
-	// Wait for the first play to finish so subsequent tests / goroutines
-	// don't leak.
-	deadline = time.Now().Add(5 * time.Second)
+	// The play goroutine should observe ctx.Done() and clear busy within a
+	// few frame intervals.
+	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && bridge.busy.Load() {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	if bridge.busy.Load() {
-		t.Fatalf("first play never released busy flag")
+		t.Fatalf("play did not stop within 2s after toggle")
+	}
+}
+
+func TestSoundboardBridge_DifferentButtonWhileBusyReturns409(t *testing.T) {
+	dir := t.TempDir()
+	a := SoundboardButton{ID: "a", Label: "A", File: "a.wav", TG: 10}
+	c := SoundboardButton{ID: "c", Label: "C", File: "c.wav", TG: 10}
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{a, c})
+
+	primeCache(t, bridge.sourcePath(a), 200)
+	primeCache(t, bridge.sourcePath(c), 200)
+	bridge.cfg.Soundboard.FrameInterval = 50 * time.Millisecond
+	bridge.cfg.Soundboard.LeadInPadding = 0
+	bridge.cfg.Soundboard.TailOutPadding = 0
+
+	rec := httptest.NewRecorder()
+	bridge.handlePlay(rec, httptest.NewRequest(http.MethodPost, "/api/play/a", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first press: %d", rec.Code)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && !bridge.busy.Load() {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	rec = httptest.NewRecorder()
+	bridge.handlePlay(rec, httptest.NewRequest(http.MethodPost, "/api/play/c", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("different-button press while busy: status %d, want 409", rec.Code)
+	}
+
+	// Drain.
+	bridge.cancelMu.Lock()
+	if bridge.cancelFn != nil {
+		bridge.cancelFn()
+	}
+	bridge.cancelMu.Unlock()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && bridge.busy.Load() {
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

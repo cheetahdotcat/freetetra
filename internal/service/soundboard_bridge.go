@@ -62,6 +62,12 @@ type SoundboardBridge struct {
 	currentID   atomic.Value // string
 	server      *http.Server
 	encodeLocks sync.Map // file path -> *sync.Mutex
+
+	// cancelMu guards cancelFn — the cancel func for the in-flight playback
+	// goroutine. Set when a play starts, cleared when it ends. A press for
+	// the currently-playing button invokes this to abort the TX.
+	cancelMu sync.Mutex
+	cancelFn context.CancelFunc
 }
 
 // ErrSoundboardBusy is returned when a play is requested while another is in flight.
@@ -332,6 +338,23 @@ func (b *SoundboardBridge) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Toggle: a press for the currently-playing button aborts the TX. We
+	// don't free busy here — the play goroutine sees ctx.Done() and clears
+	// state itself, which keeps the busy lifecycle in one place.
+	if b.busy.Load() {
+		current, _ := b.currentID.Load().(string)
+		if current == btn.ID {
+			b.cancelMu.Lock()
+			cancel := b.cancelFn
+			b.cancelMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			writeJSON(w, map[string]any{"stopped": btn.ID})
+			return
+		}
+	}
+
 	// Optional per-press TG override (?tg=NN). When set, the press TX goes
 	// to that GSSI instead of the button's manifest TG. The override is
 	// ephemeral — the manifest is never mutated.
@@ -357,17 +380,25 @@ func (b *SoundboardBridge) handlePlay(w http.ResponseWriter, r *http.Request) {
 		b.plane.EnsureGroup(overrideTG)
 	}
 
+	// Detach from the HTTP request lifetime — the press fires the call
+	// and the HTTP response returns immediately. A long TX shouldn't be
+	// cancelled by the browser closing the response. The cancel func is
+	// stashed so a same-button press can stop the playback.
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancelMu.Lock()
+	b.cancelFn = cancel
+	b.cancelMu.Unlock()
+
 	go func() {
 		defer func() {
+			b.cancelMu.Lock()
+			b.cancelFn = nil
+			b.cancelMu.Unlock()
+			cancel()
 			b.currentID.Store("")
 			b.busy.Store(false)
 		}()
-		// Detach from the HTTP request lifetime — the press fires the call
-		// and the HTTP response returns immediately. A long TX shouldn't be
-		// cancelled by the browser closing the response.
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		if err := b.playButton(ctx, playBtn); err != nil {
+		if err := b.playButton(ctx, playBtn); err != nil && !errors.Is(err, context.Canceled) {
 			b.logger.Printf("soundboard play %q failed: %v", playBtn.ID, err)
 		}
 	}()

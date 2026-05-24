@@ -43,6 +43,11 @@
     .btn:active { transform: scale(0.97); }
     .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
     .btn.playing { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
+    .btn.playing::after {
+      content: "⏹ stop"; position: absolute; bottom: 6px; left: 50%;
+      transform: translateX(-50%); font-size: 0.65rem; color: var(--red);
+      font-weight: 500; letter-spacing: 0.05em;
+    }
     .btn.uncached { border-style: dashed; }
     .btn.uncached .tg::before { content: "encoding…  "; color: var(--blue); }
     .btn .x {
@@ -270,9 +275,12 @@
 
     async function play(btn) {
       errEl.textContent = "";
+      // A press for the currently-playing button is a stop. The override
+      // dropdown is ignored in that case.
+      const isStop = busy && currentID === btn.id;
       let url = "/api/play/" + encodeURIComponent(btn.id);
-      const ovr = selectedOverrideTG();
-      if (ovrEnabled.checked) {
+      if (!isStop && ovrEnabled.checked) {
+        const ovr = selectedOverrideTG();
         if (!ovr) {
           errEl.textContent = "override on but no TG selected";
           return;
@@ -289,8 +297,16 @@
           errEl.textContent = "play failed: HTTP " + resp.status;
           return;
         }
-        busy = true;
-        currentID = btn.id;
+        const data = await resp.json().catch(() => ({}));
+        if (data.stopped) {
+          // The play goroutine will clear busy via state poll shortly; flip
+          // it locally too so the UI doesn't lag the user's intent.
+          busy = false;
+          currentID = "";
+        } else {
+          busy = true;
+          currentID = btn.id;
+        }
         applyBusyClass();
       } catch (e) {
         errEl.textContent = "play error: " + e.message;
