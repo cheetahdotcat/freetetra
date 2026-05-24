@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,12 +50,13 @@ type SoundboardManifest struct {
 // source as <file>.acelp. A press while the bridge is already transmitting
 // returns 409 — half-duplex behaviour matches a real radio.
 type SoundboardBridge struct {
-	cfg      config.Config
-	logger   *log.Logger
-	plane    *BrewModulePlane
-	manifest SoundboardManifest
+	cfg          config.Config
+	logger       *log.Logger
+	plane        *BrewModulePlane
+	manifestPath string
 
-	mu          sync.Mutex // guards startup (no concurrent encodes for the same button)
+	mu          sync.Mutex // guards manifest mutations + manifest-file writes
+	manifest    SoundboardManifest
 	busy        atomic.Bool
 	currentID   atomic.Value // string
 	server      *http.Server
@@ -83,19 +87,28 @@ func NewSoundboardBridge(cfg config.Config, logger *log.Logger, plane *BrewModul
 	}
 
 	b := &SoundboardBridge{
-		cfg:      cfg,
-		logger:   logger,
-		plane:    plane,
-		manifest: manifest,
+		cfg:          cfg,
+		logger:       logger,
+		plane:        plane,
+		manifest:     manifest,
+		manifestPath: soundboardManifestPath(cfg),
 	}
 	b.currentID.Store("")
 	return b, nil
 }
 
+func soundboardManifestPath(cfg config.Config) string {
+	if p := strings.TrimSpace(cfg.Soundboard.ManifestPath); p != "" {
+		return p
+	}
+	return filepath.Join(cfg.Soundboard.SoundsDir, "manifest.json")
+}
+
 // Manifest returns a copy for tests/inspection.
 func (b *SoundboardBridge) Manifest() SoundboardManifest {
-	out := SoundboardManifest{Buttons: append([]SoundboardButton(nil), b.manifest.Buttons...)}
-	return out
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return SoundboardManifest{Buttons: append([]SoundboardButton(nil), b.manifest.Buttons...)}
 }
 
 // Talkgroups returns the unique set of GSSIs referenced in the manifest.
@@ -161,6 +174,10 @@ func (b *SoundboardBridge) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/buttons", b.handleButtons)
 	mux.HandleFunc("/api/state", b.handleState)
 	mux.HandleFunc("/api/play/", b.handlePlay)
+	mux.HandleFunc("/api/talkgroups", b.handleTalkgroups)
+	mux.HandleFunc("/api/myinstants/search", b.handleMyinstantsSearch)
+	mux.HandleFunc("/api/myinstants/import", b.handleMyinstantsImport)
+	mux.HandleFunc("/api/buttons/", b.handleButtonsItem)
 
 	b.server = &http.Server{
 		Addr:    b.cfg.Soundboard.ListenAddr,
@@ -213,8 +230,9 @@ func (b *SoundboardBridge) handleButtons(w http.ResponseWriter, r *http.Request)
 		Color  string `json:"color,omitempty"`
 		Cached bool   `json:"cached"`
 	}
-	out := make([]view, 0, len(b.manifest.Buttons))
-	for _, btn := range b.manifest.Buttons {
+	buttons := b.snapshotButtons()
+	out := make([]view, 0, len(buttons))
+	for _, btn := range buttons {
 		_, err := os.Stat(b.cachePath(btn))
 		out = append(out, view{
 			ID:     btn.ID,
@@ -225,6 +243,68 @@ func (b *SoundboardBridge) handleButtons(w http.ResponseWriter, r *http.Request)
 		})
 	}
 	writeJSON(w, map[string]any{"buttons": out})
+}
+
+// snapshotButtons returns a defensive copy of the current manifest under lock.
+func (b *SoundboardBridge) snapshotButtons() []SoundboardButton {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]SoundboardButton(nil), b.manifest.Buttons...)
+}
+
+// handleButtonsItem supports DELETE /api/buttons/{id} so the UI can remove
+// imported clips without an SSH session. The audio source and cache are
+// left on disk — they're cheap and might still be wanted later. Only the
+// manifest entry goes away.
+func (b *SoundboardBridge) handleButtonsItem(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/buttons/")
+	id = strings.TrimSuffix(id, "/")
+	if id == "" {
+		http.Error(w, "missing button id", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		removed, err := b.deleteButton(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !removed {
+			http.Error(w, "unknown button", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (b *SoundboardBridge) deleteButton(id string) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, btn := range b.manifest.Buttons {
+		if btn.ID == id {
+			b.manifest.Buttons = append(b.manifest.Buttons[:i], b.manifest.Buttons[i+1:]...)
+			if err := b.writeManifestLocked(); err != nil {
+				// roll back so in-memory state stays consistent with disk
+				b.manifest.Buttons = append(b.manifest.Buttons, SoundboardButton{})
+				copy(b.manifest.Buttons[i+1:], b.manifest.Buttons[i:])
+				b.manifest.Buttons[i] = btn
+				return false, err
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (b *SoundboardBridge) handleTalkgroups(w http.ResponseWriter, r *http.Request) {
+	// Surface the unique TG set the manifest currently uses so the UI can
+	// show a quick-pick dropdown. The import endpoint accepts any non-zero
+	// TG (and registers it with the plane), so this is just a convenience.
+	tgs := SoundboardTalkgroups(SoundboardManifest{Buttons: b.snapshotButtons()})
+	writeJSON(w, map[string]any{"talkgroups": tgs})
 }
 
 func (b *SoundboardBridge) handleState(w http.ResponseWriter, r *http.Request) {
@@ -275,12 +355,214 @@ func (b *SoundboardBridge) handlePlay(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *SoundboardBridge) buttonByID(id string) (SoundboardButton, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, btn := range b.manifest.Buttons {
 		if btn.ID == id {
 			return btn, true
 		}
 	}
 	return SoundboardButton{}, false
+}
+
+// ----- myinstants integration -----
+
+// myinstantsUA is set on the upstream request because myinstants.com
+// returns 403 to default Go http clients. The string is unremarkable —
+// what matters is that "Mozilla/5.0" is present.
+const myinstantsUA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+
+var (
+	myinstantsMP3Re   = regexp.MustCompile(`play\('(/media/sounds/[^']+\.mp3)'`)
+	myinstantsTitleRe = regexp.MustCompile(`instant-link link-secondary"[^>]*>([^<]+)</a>`)
+)
+
+type myinstantsResult struct {
+	Title  string `json:"title"`
+	MP3URL string `json:"mp3_url"`
+}
+
+func (b *SoundboardBridge) handleMyinstantsSearch(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "missing q", http.StatusBadRequest)
+		return
+	}
+	results, err := searchMyinstants(r.Context(), q)
+	if err != nil {
+		b.logger.Printf("soundboard myinstants search %q failed: %v", q, err)
+		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"results": results})
+}
+
+func searchMyinstants(ctx context.Context, query string) ([]myinstantsResult, error) {
+	u := "https://www.myinstants.com/en/search/?name=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", myinstantsUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	return parseMyinstantsResults(string(body)), nil
+}
+
+// parseMyinstantsResults scans the search HTML and zips the play('...') URLs
+// with the visible link titles. The page emits one of each per result card
+// in lockstep, so positional zip matches reliably; if myinstants changes the
+// layout this is the spot to revisit.
+func parseMyinstantsResults(html string) []myinstantsResult {
+	mp3s := myinstantsMP3Re.FindAllStringSubmatch(html, -1)
+	titles := myinstantsTitleRe.FindAllStringSubmatch(html, -1)
+	n := len(mp3s)
+	if len(titles) < n {
+		n = len(titles)
+	}
+	out := make([]myinstantsResult, 0, n)
+	for i := 0; i < n; i++ {
+		title := htmlUnescape(strings.TrimSpace(titles[i][1]))
+		out = append(out, myinstantsResult{
+			Title:  title,
+			MP3URL: "https://www.myinstants.com" + mp3s[i][1],
+		})
+	}
+	return out
+}
+
+type importRequest struct {
+	Title  string `json:"title"`
+	MP3URL string `json:"mp3_url"`
+	TG     uint32 `json:"tg"`
+	Color  string `json:"color,omitempty"`
+}
+
+func (b *SoundboardBridge) handleMyinstantsImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req importRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		http.Error(w, "title required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.MP3URL, "https://www.myinstants.com/media/sounds/") {
+		http.Error(w, "mp3_url must be a myinstants /media/sounds/ URL", http.StatusBadRequest)
+		return
+	}
+	if req.TG == 0 {
+		http.Error(w, "tg must be > 0", http.StatusBadRequest)
+		return
+	}
+
+	btn, err := b.importMyinstantsClip(r.Context(), req)
+	if err != nil {
+		b.logger.Printf("soundboard import %q failed: %v", req.Title, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, btn)
+}
+
+func (b *SoundboardBridge) importMyinstantsClip(ctx context.Context, req importRequest) (SoundboardButton, error) {
+	slug := slugify(req.Title)
+	if slug == "" {
+		slug = "clip"
+	}
+
+	// Decide the on-disk filename + button id under the lock so two parallel
+	// imports of the same title don't pick the same slug.
+	b.mu.Lock()
+	id := b.uniqueIDLocked(slug)
+	filename := id + ".mp3"
+	target := filepath.Join(b.cfg.Soundboard.SoundsDir, filename)
+	// Pre-register the slot so a parallel import sees the id as taken.
+	pending := SoundboardButton{ID: id, Label: req.Title, File: filename, TG: req.TG, Color: req.Color}
+	b.manifest.Buttons = append(b.manifest.Buttons, pending)
+	b.mu.Unlock()
+
+	if err := downloadFile(ctx, req.MP3URL, target); err != nil {
+		// Undo the optimistic manifest append.
+		b.removeButtonByID(id)
+		return SoundboardButton{}, fmt.Errorf("download: %w", err)
+	}
+
+	// Persist manifest + register the GSSI with the brew plane so TX is
+	// accepted on this TG. Both are recoverable failures; if either errors
+	// we still keep the file on disk.
+	b.plane.EnsureGroup(req.TG)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.writeManifestLocked(); err != nil {
+		return SoundboardButton{}, fmt.Errorf("persist manifest: %w", err)
+	}
+	b.logger.Printf("soundboard imported %q -> %s (tg=%d id=%s)", req.Title, filename, req.TG, id)
+	return pending, nil
+}
+
+func (b *SoundboardBridge) removeButtonByID(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, btn := range b.manifest.Buttons {
+		if btn.ID == id {
+			b.manifest.Buttons = append(b.manifest.Buttons[:i], b.manifest.Buttons[i+1:]...)
+			return
+		}
+	}
+}
+
+// uniqueIDLocked returns slug, or slug_2, slug_3, ... if slug is already used.
+// Caller must hold b.mu.
+func (b *SoundboardBridge) uniqueIDLocked(slug string) string {
+	taken := make(map[string]bool, len(b.manifest.Buttons))
+	for _, btn := range b.manifest.Buttons {
+		taken[btn.ID] = true
+	}
+	if !taken[slug] {
+		return slug
+	}
+	for n := 2; n < 1000; n++ {
+		cand := fmt.Sprintf("%s_%d", slug, n)
+		if !taken[cand] {
+			return cand
+		}
+	}
+	return fmt.Sprintf("%s_%d", slug, time.Now().UnixNano())
+}
+
+// writeManifestLocked persists the in-memory manifest atomically. Caller
+// must hold b.mu.
+func (b *SoundboardBridge) writeManifestLocked() error {
+	tmp := b.manifestPath + ".tmp"
+	raw, err := json.MarshalIndent(b.manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, b.manifestPath)
 }
 
 // ----- TX path -----
@@ -535,6 +817,63 @@ func readFrames(path string) ([][]byte, error) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// slugify reduces an arbitrary title to a filename/id-safe ASCII string.
+// Lowercased, non-alphanumeric runs collapsed to underscores, trimmed.
+func slugify(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	prevUnderscore := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevUnderscore = false
+		} else if !prevUnderscore {
+			b.WriteByte('_')
+			prevUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+// htmlUnescape is a thin alias so the call site reads cleanly.
+func htmlUnescape(s string) string { return html.UnescapeString(s) }
+
+// downloadFile fetches u with a browser User-Agent (myinstants returns 403
+// to default Go clients) and writes the body atomically to dst. The download
+// is capped at 25 MiB to keep an attacker from filling the disk via the
+// import endpoint.
+func downloadFile(ctx context.Context, u, dst string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", myinstantsUA)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	tmp := dst + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, io.LimitReader(resp.Body, 25*1024*1024)); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 func drain(logger *log.Logger, tag string, r io.Reader) {

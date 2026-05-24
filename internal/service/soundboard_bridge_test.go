@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +257,149 @@ func TestSoundboardBridge_IndexServesEmbeddedHTML(t *testing.T) {
 	}
 	if !bytes.Contains(rec.Body.Bytes(), []byte("FreeTetra Soundboard")) {
 		t.Fatalf("index body missing title; got %d bytes", rec.Body.Len())
+	}
+}
+
+func TestSlugify(t *testing.T) {
+	cases := map[string]string{
+		"YIPPEE":                  "yippee",
+		"omg bist du lost":        "omg_bist_du_lost",
+		"German Spongebob":        "german_spongebob",
+		"Wochenende, Saufen!":     "wochenende_saufen",
+		"  weird---thing.mp3  ":   "weird_thing_mp3",
+		"!!!":                     "",
+	}
+	for in, want := range cases {
+		if got := slugify(in); got != want {
+			t.Errorf("slugify(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseMyinstantsResults(t *testing.T) {
+	// Trimmed to the parts our two regexes care about.
+	page := `
+		<div class="instant" onmousedown="play('/media/sounds/yippee.mp3', this, 'y1')">
+		  <a class="instant-link link-secondary" href="/en/instant/yippee/">YIPPEE</a>
+		</div>
+		<div class="instant" onmousedown="play('/media/sounds/german-spongebob_Qwr5UGa.mp3', this, 'gs')">
+		  <a class="instant-link link-secondary" href="/en/instant/spongebob/">German Spongebob</a>
+		</div>
+	`
+	res := parseMyinstantsResults(page)
+	if len(res) != 2 {
+		t.Fatalf("got %d results, want 2", len(res))
+	}
+	if res[0].Title != "YIPPEE" || res[0].MP3URL != "https://www.myinstants.com/media/sounds/yippee.mp3" {
+		t.Errorf("result[0] = %+v", res[0])
+	}
+	if res[1].Title != "German Spongebob" || !strings.Contains(res[1].MP3URL, "german-spongebob_") {
+		t.Errorf("result[1] = %+v", res[1])
+	}
+}
+
+func TestImportFlow_DownloadsAndPersists(t *testing.T) {
+	// Stub the upstream "myinstants" mp3 host.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = w.Write([]byte("ID3 fake mp3 body"))
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	// Manifest starts with one button so we can verify the new one is
+	// appended (not overwriting).
+	existing := SoundboardButton{ID: "preexisting", Label: "Pre", File: "pre.wav", TG: 10}
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{existing})
+
+	// importMyinstantsClip checks the URL prefix — so we need to route
+	// through a host the bridge accepts. We bypass the handler's URL
+	// validation by calling importMyinstantsClip directly. The bridge's
+	// downloadFile helper does the actual fetching.
+	req := importRequest{
+		Title:  "YIPPEE!!!",
+		MP3URL: upstream.URL + "/yippee.mp3",
+		TG:     25,
+	}
+	btn, err := bridge.importMyinstantsClip(context.Background(), req)
+	if err != nil {
+		t.Fatalf("importMyinstantsClip: %v", err)
+	}
+	if btn.ID != "yippee" {
+		t.Errorf("btn.ID = %q, want yippee", btn.ID)
+	}
+	if btn.TG != 25 {
+		t.Errorf("btn.TG = %d, want 25", btn.TG)
+	}
+
+	// File downloaded?
+	if _, err := os.Stat(filepath.Join(dir, "yippee.mp3")); err != nil {
+		t.Errorf("expected yippee.mp3 in sounds dir: %v", err)
+	}
+
+	// Manifest persisted with both buttons?
+	persisted, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read persisted manifest: %v", err)
+	}
+	var got SoundboardManifest
+	if err := json.Unmarshal(persisted, &got); err != nil {
+		t.Fatalf("parse persisted manifest: %v", err)
+	}
+	if len(got.Buttons) != 2 {
+		t.Fatalf("persisted has %d buttons, want 2", len(got.Buttons))
+	}
+}
+
+func TestImportFlow_UniqueIDOnCollision(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ID3 fake"))
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{
+		{ID: "yippee", Label: "Y", File: "yippee.mp3", TG: 10},
+	})
+
+	btn, err := bridge.importMyinstantsClip(context.Background(), importRequest{
+		Title:  "YIPPEE",
+		MP3URL: upstream.URL + "/yippee.mp3",
+		TG:     10,
+	})
+	if err != nil {
+		t.Fatalf("importMyinstantsClip: %v", err)
+	}
+	if btn.ID != "yippee_2" {
+		t.Errorf("collision: got id %q, want yippee_2", btn.ID)
+	}
+}
+
+func TestDeleteButton_PersistsAndReturns404ForUnknown(t *testing.T) {
+	dir := t.TempDir()
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{
+		{ID: "a", Label: "A", File: "a.wav", TG: 10},
+		{ID: "b", Label: "B", File: "b.wav", TG: 10},
+	})
+
+	rec := httptest.NewRecorder()
+	bridge.handleButtonsItem(rec, httptest.NewRequest(http.MethodDelete, "/api/buttons/a", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete a: status %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	bridge.handleButtonsItem(rec, httptest.NewRequest(http.MethodDelete, "/api/buttons/missing", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete missing: status %d", rec.Code)
+	}
+
+	// Persisted manifest now has only "b".
+	raw, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	var got SoundboardManifest
+	_ = json.Unmarshal(raw, &got)
+	if len(got.Buttons) != 1 || got.Buttons[0].ID != "b" {
+		t.Errorf("persisted after delete: %+v", got.Buttons)
 	}
 }
 

@@ -8,18 +8,22 @@
     :root {
       --bg: #0a0d12;
       --bg-card: #111827;
+      --bg-input: #1a2030;
       --border: #1f2937;
+      --border-hover: #374151;
       --text: #e5e7eb;
       --text-dim: #9ca3af;
+      --text-muted: #6b7280;
       --accent: #6ee7b7;
       --blue: #60a5fa;
       --red: #f87171;
     }
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; min-height: 100vh; }
     .shell { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
     h1 { font-size: 1.5rem; font-weight: 700; margin: 0; }
     h1 span { color: var(--accent); }
+    h2 { font-size: 0.9rem; font-weight: 600; margin: 24px 0 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
     .status { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; color: var(--text-dim); }
     .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; vertical-align: middle; }
     .status.busy .dot { background: var(--red); animation: pulse 1s infinite; }
@@ -27,7 +31,7 @@
 
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
     .btn {
-      background: var(--bg-card); color: var(--text);
+      background: var(--bg-card); color: var(--text); position: relative;
       border: 1px solid var(--border); border-radius: 10px;
       padding: 18px 14px; cursor: pointer; user-select: none;
       font-size: 0.95rem; font-weight: 600; min-height: 100px;
@@ -41,9 +45,56 @@
     .btn.playing { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
     .btn.uncached { border-style: dashed; }
     .btn.uncached .tg::before { content: "encoding…  "; color: var(--blue); }
+    .btn .x {
+      position: absolute; top: 4px; right: 6px; font-size: 0.7rem;
+      color: var(--text-muted); padding: 2px 6px; border-radius: 4px;
+      opacity: 0; transition: opacity 0.15s ease;
+    }
+    .btn:hover .x { opacity: 1; }
+    .btn .x:hover { background: rgba(248, 113, 113, 0.18); color: var(--red); }
 
     .empty { color: var(--text-dim); text-align: center; padding: 40px; }
     .err { color: var(--red); font-size: 0.85rem; margin-top: 12px; }
+
+    /* myinstants search panel */
+    .panel {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px; margin-bottom: 16px;
+    }
+    .search-row { display: flex; gap: 8px; }
+    .search-row input[type="text"], .search-row select, .panel input[type="number"] {
+      background: var(--bg-input); border: 1px solid var(--border);
+      color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 0.9rem;
+      font-family: inherit; outline: none;
+    }
+    .search-row input[type="text"]:focus, .panel input[type="number"]:focus, .panel select:focus { border-color: var(--accent); }
+    .search-row input[type="text"] { flex: 1; }
+    .search-row button {
+      background: var(--accent); color: #052e1c; border: 0; padding: 8px 18px;
+      border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.9rem;
+    }
+    .search-row button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .tg-row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    .tg-row label { font-size: 0.8rem; color: var(--text-dim); }
+    .tg-row select, .tg-row input { width: 110px; }
+
+    .results { margin-top: 14px; max-height: 360px; overflow-y: auto; }
+    .res {
+      display: flex; align-items: center; gap: 10px; padding: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .res:last-child { border-bottom: 0; }
+    .res .t { flex: 1; font-size: 0.9rem; }
+    .res button {
+      background: var(--bg-input); color: var(--text); border: 1px solid var(--border);
+      padding: 5px 10px; border-radius: 5px; font-size: 0.78rem; cursor: pointer;
+      font-family: inherit;
+    }
+    .res button.imp { background: var(--blue); color: #051934; border-color: var(--blue); font-weight: 600; }
+    .res button:hover:not(:disabled) { border-color: var(--accent); }
+    .res button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .res audio { height: 32px; }
   </style>
 </head>
 <body>
@@ -52,18 +103,44 @@
       <h1>Free<span>Tetra</span> Soundboard</h1>
       <div id="status" class="status"><span class="dot"></span><span class="text">idle</span></div>
     </header>
+
+    <div class="panel">
+      <h2 style="margin-top:0">Add from myinstants.com</h2>
+      <div class="search-row">
+        <input id="q" type="text" placeholder="e.g. German, Hello, drama" autocomplete="off" />
+        <button id="searchBtn" type="button">Search</button>
+      </div>
+      <div class="tg-row">
+        <label for="impTg">Talkgroup for import:</label>
+        <select id="impTgPick"></select>
+        <input id="impTgNew" type="number" min="1" placeholder="new TG" />
+      </div>
+      <div id="results" class="results"></div>
+      <div id="searchErr" class="err"></div>
+    </div>
+
+    <h2>Buttons</h2>
     <div id="grid" class="grid"></div>
-    <div id="empty" class="empty" style="display:none">No buttons configured. Edit your <code>manifest.json</code> and restart.</div>
+    <div id="empty" class="empty" style="display:none">No buttons configured yet. Search above to import.</div>
     <div id="err" class="err"></div>
   </div>
+
   <script>
     const grid = document.getElementById("grid");
     const empty = document.getElementById("empty");
     const errEl = document.getElementById("err");
     const statusEl = document.getElementById("status");
+    const searchInp = document.getElementById("q");
+    const searchBtn = document.getElementById("searchBtn");
+    const resultsEl = document.getElementById("results");
+    const searchErr = document.getElementById("searchErr");
+    const impTgPick = document.getElementById("impTgPick");
+    const impTgNew = document.getElementById("impTgNew");
+
     let buttons = [];
     let busy = false;
     let currentID = "";
+    let knownTGs = [];
 
     async function loadButtons() {
       try {
@@ -75,6 +152,32 @@
       } catch (e) {
         errEl.textContent = "load error: " + e.message;
       }
+    }
+
+    async function loadTGs() {
+      try {
+        const resp = await fetch("/api/talkgroups");
+        if (!resp.ok) return;
+        const data = await resp.json();
+        knownTGs = data.talkgroups || [];
+        renderTGPicker();
+      } catch {/* ignore */}
+    }
+
+    function renderTGPicker() {
+      const prev = impTgPick.value;
+      impTgPick.innerHTML = "";
+      const optEmpty = document.createElement("option");
+      optEmpty.value = ""; optEmpty.textContent = "— pick TG —";
+      impTgPick.appendChild(optEmpty);
+      for (const tg of knownTGs) {
+        const o = document.createElement("option");
+        o.value = String(tg); o.textContent = "TG " + tg;
+        impTgPick.appendChild(o);
+      }
+      // Re-select previous selection if still present.
+      if (prev && knownTGs.includes(Number(prev))) impTgPick.value = prev;
+      else if (knownTGs.length) impTgPick.value = String(knownTGs[0]);
     }
 
     function renderGrid() {
@@ -89,8 +192,20 @@
         el.className = "btn";
         if (!btn.cached) el.classList.add("uncached");
         if (btn.color) el.style.background = btn.color;
-        el.innerHTML = `<div>${escape(btn.label || btn.id)}</div><div class="tg">TG ${btn.tg}</div>`;
-        el.addEventListener("click", () => play(btn));
+        el.innerHTML = `
+          <span class="x" title="Remove" data-del="${btn.id}">✕</span>
+          <div>${escape(btn.label || btn.id)}</div>
+          <div class="tg">TG ${btn.tg}</div>
+        `;
+        el.addEventListener("click", (ev) => {
+          const del = ev.target.closest("[data-del]");
+          if (del) {
+            ev.stopPropagation();
+            void deleteButton(del.dataset.del);
+            return;
+          }
+          play(btn);
+        });
         el.dataset.id = btn.id;
         grid.appendChild(el);
       }
@@ -115,12 +230,26 @@
           errEl.textContent = "play failed: HTTP " + resp.status;
           return;
         }
-        // The server flips busy=true on success; poll picks it up shortly.
         busy = true;
         currentID = btn.id;
         applyBusyClass();
       } catch (e) {
         errEl.textContent = "play error: " + e.message;
+      }
+    }
+
+    async function deleteButton(id) {
+      if (!confirm("Remove “" + id + "” from the soundboard?")) return;
+      try {
+        const resp = await fetch("/api/buttons/" + encodeURIComponent(id), { method: "DELETE" });
+        if (!resp.ok) {
+          errEl.textContent = "delete failed: HTTP " + resp.status;
+          return;
+        }
+        await loadButtons();
+        await loadTGs();
+      } catch (e) {
+        errEl.textContent = "delete error: " + e.message;
       }
     }
 
@@ -135,8 +264,7 @@
           busy = newBusy;
           currentID = newID;
           applyBusyClass();
-          // Cache state may have flipped (first press → cache written).
-          if (!busy) void loadButtons();
+          if (!busy) void loadButtons(); // cache may have flipped after the first press
         }
       } catch {/* swallow */}
     }
@@ -151,7 +279,94 @@
       }
     }
 
+    // ---- myinstants search + import ----
+
+    function selectedTG() {
+      const newVal = impTgNew.value.trim();
+      if (newVal) {
+        const n = parseInt(newVal, 10);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+      const pickVal = impTgPick.value;
+      if (pickVal) return parseInt(pickVal, 10);
+      return 0;
+    }
+
+    async function doSearch() {
+      const q = searchInp.value.trim();
+      if (!q) return;
+      searchErr.textContent = "";
+      searchBtn.disabled = true;
+      resultsEl.innerHTML = "<div style='color:var(--text-dim);font-size:0.85rem'>searching…</div>";
+      try {
+        const resp = await fetch("/api/myinstants/search?q=" + encodeURIComponent(q));
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const data = await resp.json();
+        renderResults(data.results || []);
+      } catch (e) {
+        searchErr.textContent = "search error: " + e.message;
+        resultsEl.innerHTML = "";
+      } finally {
+        searchBtn.disabled = false;
+      }
+    }
+
+    function renderResults(rows) {
+      resultsEl.innerHTML = "";
+      if (!rows.length) {
+        resultsEl.innerHTML = "<div style='color:var(--text-dim);font-size:0.85rem'>no results</div>";
+        return;
+      }
+      for (const r of rows) {
+        const row = document.createElement("div");
+        row.className = "res";
+        row.innerHTML = `
+          <div class="t">${escape(r.title)}</div>
+          <audio controls preload="none" src="${r.mp3_url}"></audio>
+          <button type="button" class="imp">Import</button>
+        `;
+        row.querySelector(".imp").addEventListener("click", () => importClip(r, row));
+        resultsEl.appendChild(row);
+      }
+    }
+
+    async function importClip(r, row) {
+      const tg = selectedTG();
+      if (!tg) {
+        searchErr.textContent = "pick a talkgroup first (or type a new one)";
+        return;
+      }
+      const btn = row.querySelector(".imp");
+      btn.disabled = true;
+      btn.textContent = "importing…";
+      searchErr.textContent = "";
+      try {
+        const resp = await fetch("/api/myinstants/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: r.title, mp3_url: r.mp3_url, tg: tg }),
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || ("HTTP " + resp.status));
+        }
+        btn.textContent = "✓ imported";
+        await loadButtons();
+        await loadTGs();
+      } catch (e) {
+        searchErr.textContent = "import error: " + e.message;
+        btn.disabled = false;
+        btn.textContent = "Import";
+      }
+    }
+
+    searchBtn.addEventListener("click", doSearch);
+    searchInp.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); doSearch(); }
+    });
+
     void loadButtons();
+    void loadTGs();
     setInterval(pollState, 500);
   </script>
 </body>

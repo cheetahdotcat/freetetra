@@ -232,6 +232,33 @@ func (p *BrewModulePlane) enqueue(payload []byte) bool {
 	}
 }
 
+// EnsureGroup adds gssi to the plane's affiliation list if it isn't already
+// present. If the plane has an active session, a fresh SubscriberAffiliate
+// is queued with the full updated list so the brew server starts routing
+// traffic for the new GSSI. Returns true if the set was modified.
+func (p *BrewModulePlane) EnsureGroup(gssi uint32) bool {
+	if gssi == 0 {
+		return false
+	}
+	p.mu.Lock()
+	for _, existing := range p.groups {
+		if existing == gssi {
+			p.mu.Unlock()
+			return false
+		}
+	}
+	p.groups = append(p.groups, gssi)
+	snapshot := append([]uint32(nil), p.groups...)
+	isi := p.subscriberISSI
+	connected := p.connected
+	p.mu.Unlock()
+
+	if connected && isi != 0 {
+		p.enqueue(brew.BuildSubscriberAffiliate(isi, snapshot))
+	}
+	return true
+}
+
 func (p *BrewModulePlane) setConnected(v bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
