@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -331,11 +332,30 @@ func (b *SoundboardBridge) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional per-press TG override (?tg=NN). When set, the press TX goes
+	// to that GSSI instead of the button's manifest TG. The override is
+	// ephemeral — the manifest is never mutated.
+	overrideTG := uint32(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("tg")); raw != "" {
+		n, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil || n == 0 {
+			http.Error(w, "invalid tg override", http.StatusBadRequest)
+			return
+		}
+		overrideTG = uint32(n)
+	}
+
 	if !b.busy.CompareAndSwap(false, true) {
 		http.Error(w, "busy", http.StatusConflict)
 		return
 	}
 	b.currentID.Store(btn.ID)
+
+	playBtn := btn
+	if overrideTG != 0 {
+		playBtn.TG = overrideTG
+		b.plane.EnsureGroup(overrideTG)
+	}
 
 	go func() {
 		defer func() {
@@ -347,11 +367,11 @@ func (b *SoundboardBridge) handlePlay(w http.ResponseWriter, r *http.Request) {
 		// cancelled by the browser closing the response.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		if err := b.playButton(ctx, btn); err != nil {
-			b.logger.Printf("soundboard play %q failed: %v", btn.ID, err)
+		if err := b.playButton(ctx, playBtn); err != nil {
+			b.logger.Printf("soundboard play %q failed: %v", playBtn.ID, err)
 		}
 	}()
-	writeJSON(w, map[string]any{"started": btn.ID})
+	writeJSON(w, map[string]any{"started": btn.ID, "tg": playBtn.TG})
 }
 
 func (b *SoundboardBridge) buttonByID(id string) (SoundboardButton, bool) {

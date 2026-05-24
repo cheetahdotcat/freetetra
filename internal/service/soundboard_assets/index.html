@@ -76,8 +76,11 @@
     .search-row button:disabled { opacity: 0.4; cursor: not-allowed; }
 
     .tg-row { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
-    .tg-row label { font-size: 0.8rem; color: var(--text-dim); }
-    .tg-row select, .tg-row input { width: 110px; }
+    .tg-row label { font-size: 0.8rem; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+    .tg-row select, .tg-row input[type="number"] { width: 110px; }
+    .tg-hint { font-size: 0.78rem; color: var(--text-muted); }
+    .tg-row.disabled select, .tg-row.disabled input[type="number"] { opacity: 0.45; pointer-events: none; }
+    #overridePanel.active { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
 
     .results { margin-top: 14px; max-height: 360px; overflow-y: auto; }
     .res {
@@ -103,6 +106,16 @@
       <h1>Free<span>Tetra</span> Soundboard</h1>
       <div id="status" class="status"><span class="dot"></span><span class="text">idle</span></div>
     </header>
+
+    <div class="panel" id="overridePanel">
+      <h2 style="margin-top:0">TG override</h2>
+      <div class="tg-row">
+        <label><input type="checkbox" id="ovrEnabled" /> Override button TG</label>
+        <select id="ovrPick"></select>
+        <input id="ovrNew" type="number" min="1" placeholder="or new TG" />
+        <span id="ovrHint" class="tg-hint">— next press goes to the picked TG instead</span>
+      </div>
+    </div>
 
     <div class="panel">
       <h2 style="margin-top:0">Add from myinstants.com</h2>
@@ -136,6 +149,11 @@
     const searchErr = document.getElementById("searchErr");
     const impTgPick = document.getElementById("impTgPick");
     const impTgNew = document.getElementById("impTgNew");
+    const ovrEnabled = document.getElementById("ovrEnabled");
+    const ovrPick = document.getElementById("ovrPick");
+    const ovrNew = document.getElementById("ovrNew");
+    const ovrHint = document.getElementById("ovrHint");
+    const overridePanel = document.getElementById("overridePanel");
 
     let buttons = [];
     let busy = false;
@@ -165,19 +183,51 @@
     }
 
     function renderTGPicker() {
-      const prev = impTgPick.value;
-      impTgPick.innerHTML = "";
+      fillTGSelect(impTgPick, "— pick TG —");
+      fillTGSelect(ovrPick, "— pick TG —");
+    }
+
+    function fillTGSelect(sel, placeholder) {
+      const prev = sel.value;
+      sel.innerHTML = "";
       const optEmpty = document.createElement("option");
-      optEmpty.value = ""; optEmpty.textContent = "— pick TG —";
-      impTgPick.appendChild(optEmpty);
+      optEmpty.value = ""; optEmpty.textContent = placeholder;
+      sel.appendChild(optEmpty);
       for (const tg of knownTGs) {
         const o = document.createElement("option");
         o.value = String(tg); o.textContent = "TG " + tg;
-        impTgPick.appendChild(o);
+        sel.appendChild(o);
       }
-      // Re-select previous selection if still present.
-      if (prev && knownTGs.includes(Number(prev))) impTgPick.value = prev;
-      else if (knownTGs.length) impTgPick.value = String(knownTGs[0]);
+      if (prev && knownTGs.includes(Number(prev))) sel.value = prev;
+      else if (knownTGs.length) sel.value = String(knownTGs[0]);
+    }
+
+    function selectedOverrideTG() {
+      if (!ovrEnabled.checked) return 0;
+      const newVal = ovrNew.value.trim();
+      if (newVal) {
+        const n = parseInt(newVal, 10);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+      const pickVal = ovrPick.value;
+      if (pickVal) return parseInt(pickVal, 10);
+      return 0;
+    }
+
+    function applyOverrideUI() {
+      const active = ovrEnabled.checked;
+      overridePanel.classList.toggle("active", active);
+      overridePanel.querySelector(".tg-row").classList.toggle("disabled", !active);
+      const tg = selectedOverrideTG();
+      if (active) {
+        ovrHint.textContent = tg
+          ? "→ next press goes to TG " + tg
+          : "→ pick a TG (dropdown or number field)";
+        ovrHint.style.color = tg ? "var(--blue)" : "var(--red)";
+      } else {
+        ovrHint.textContent = "— next press goes to the picked TG instead";
+        ovrHint.style.color = "";
+      }
     }
 
     function renderGrid() {
@@ -220,8 +270,17 @@
 
     async function play(btn) {
       errEl.textContent = "";
+      let url = "/api/play/" + encodeURIComponent(btn.id);
+      const ovr = selectedOverrideTG();
+      if (ovrEnabled.checked) {
+        if (!ovr) {
+          errEl.textContent = "override on but no TG selected";
+          return;
+        }
+        url += "?tg=" + encodeURIComponent(ovr);
+      }
       try {
-        const resp = await fetch("/api/play/" + encodeURIComponent(btn.id), { method: "POST" });
+        const resp = await fetch(url, { method: "POST" });
         if (resp.status === 409) {
           errEl.textContent = "busy — another sound is playing";
           return;
@@ -365,9 +424,14 @@
       if (ev.key === "Enter") { ev.preventDefault(); doSearch(); }
     });
 
+    ovrEnabled.addEventListener("change", applyOverrideUI);
+    ovrPick.addEventListener("change", applyOverrideUI);
+    ovrNew.addEventListener("input", applyOverrideUI);
+
     void loadButtons();
-    void loadTGs();
+    void loadTGs().then(applyOverrideUI);
     setInterval(pollState, 500);
+    applyOverrideUI();
   </script>
 </body>
 </html>

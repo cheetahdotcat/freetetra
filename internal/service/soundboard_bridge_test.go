@@ -175,6 +175,63 @@ func TestSoundboardBridge_PlayRejectsSecondPressWhileBusy(t *testing.T) {
 	}
 }
 
+func TestSoundboardBridge_PlayWithTGOverride(t *testing.T) {
+	dir := t.TempDir()
+	btn := SoundboardButton{ID: "x", Label: "X", File: "x.wav", TG: 10}
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{btn})
+	primeCache(t, bridge.sourcePath(btn), 5)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/play/x?tg=42", nil)
+	rec := httptest.NewRecorder()
+	bridge.handlePlay(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("override press: status %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, _ := resp["tg"].(float64); uint32(got) != 42 {
+		t.Errorf("response.tg = %v, want 42", resp["tg"])
+	}
+	// Plane should have learned the new TG.
+	found := false
+	for _, g := range bridge.plane.groups {
+		if g == 42 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected plane.groups to contain override TG 42, got %v", bridge.plane.groups)
+	}
+
+	// Drain the in-flight play.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && bridge.busy.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSoundboardBridge_PlayRejectsInvalidTGOverride(t *testing.T) {
+	dir := t.TempDir()
+	btn := SoundboardButton{ID: "x", Label: "X", File: "x.wav", TG: 10}
+	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{btn})
+	primeCache(t, bridge.sourcePath(btn), 5)
+
+	for _, q := range []string{"abc", "0", "-5"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/play/x?tg="+q, nil)
+		rec := httptest.NewRecorder()
+		bridge.handlePlay(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("tg=%q: status %d, want 400", q, rec.Code)
+		}
+	}
+	if bridge.busy.Load() {
+		t.Fatalf("invalid override should not have flipped busy")
+	}
+}
+
 func TestSoundboardBridge_PlayUnknownButton(t *testing.T) {
 	dir := t.TempDir()
 	bridge := newTestSoundboardBridge(t, dir, []SoundboardButton{
