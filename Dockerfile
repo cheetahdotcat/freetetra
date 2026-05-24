@@ -35,6 +35,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -tags web_embed -ldflags '-extldflags "-st
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-webradio ./cmd/tetra-brew-webradio
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-echo ./cmd/tetra-brew-echo
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-proxy ./cmd/tetra-brew-proxy
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-soundboard ./cmd/tetra-brew-soundboard
 
 # Build ACELP encoder/decoder from included source.
 # Only the non-main sources go in; encoder.c/encoder_stdio.c/decoder.c each
@@ -51,6 +52,7 @@ COPY --from=build /out/tetra-brew /app/tetra-brew
 COPY --from=build /out/tetra-brew-webradio /app/tetra-brew-webradio
 COPY --from=build /out/tetra-brew-echo /app/tetra-brew-echo
 COPY --from=build /out/tetra-brew-proxy /app/tetra-brew-proxy
+COPY --from=build /out/tetra-brew-soundboard /app/tetra-brew-soundboard
 COPY --from=build /out/tetra-acelp-stdio /app/tetra-acelp-stdio
 COPY --from=build /out/tetra-acelp-decoder /app/tetra-acelp-decoder
 

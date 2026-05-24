@@ -27,6 +27,7 @@ type Config struct {
 	Zello      ZelloConfig
 	Echo       EchoConfig
 	Proxy      ProxyConfig
+	Soundboard SoundboardConfig
 	RadioID    RadioIDConfig
 	APRS       APRSConfig
 	MOTD       MOTDConfig
@@ -205,6 +206,24 @@ type ProxyConfig struct {
 	MaxConcurrent int
 }
 
+type SoundboardConfig struct {
+	Enabled          bool
+	ListenAddr       string
+	SoundsDir        string
+	ManifestPath     string // optional override; defaults to <SoundsDir>/manifest.json
+	BrewISSI         uint32 // identity used for the brew-client login
+	SourceISSI       uint32 // ISSI stamped on TX frames; falls back to BrewISSI
+	FFmpegBin        string
+	EncoderBin       string
+	EncoderArgs      string
+	EncoderFrameSize int
+	FrameInterval    time.Duration
+	LeadInPadding    time.Duration // silent padding emitted before the audio
+	TailOutPadding   time.Duration // silent padding emitted after the audio
+	ReconnectDelay   time.Duration
+	ReleaseCause     uint8
+}
+
 func LoadFromEnv() (Config, error) {
 	_ = loadDotEnv(".env")
 
@@ -378,10 +397,27 @@ func LoadFromEnv() (Config, error) {
 			IdleTimeout:   envDuration("PROXY_IDLE_TIMEOUT", 60*time.Second),
 			MaxConcurrent: envInt("PROXY_MAX_CONCURRENT", 4),
 		},
+		Soundboard: SoundboardConfig{
+			Enabled:          envBool("SOUNDBOARD_ENABLED", false),
+			ListenAddr:       env("SOUNDBOARD_LISTEN_ADDR", ":8203"),
+			SoundsDir:        env("SOUNDBOARD_SOUNDS_DIR", "/app/sounds"),
+			ManifestPath:     env("SOUNDBOARD_MANIFEST_PATH", ""),
+			BrewISSI:         uint32(envInt("SOUNDBOARD_BREW_ISSI", 899003)),
+			SourceISSI:       uint32(envInt("SOUNDBOARD_SOURCE_ISSI", 0)),
+			FFmpegBin:        env("SOUNDBOARD_FFMPEG_BIN", "ffmpeg"),
+			EncoderBin:       env("SOUNDBOARD_ENCODER_BIN", "tetra-acelp-stdio"),
+			EncoderArgs:      env("SOUNDBOARD_ENCODER_ARGS", ""),
+			EncoderFrameSize: envInt("SOUNDBOARD_ENCODER_FRAME_SIZE", 18),
+			FrameInterval:    envDuration("SOUNDBOARD_FRAME_INTERVAL", 60*time.Millisecond),
+			LeadInPadding:    envDuration("SOUNDBOARD_LEAD_IN", 240*time.Millisecond),
+			TailOutPadding:   envDuration("SOUNDBOARD_TAIL_OUT", 240*time.Millisecond),
+			ReconnectDelay:   envDuration("SOUNDBOARD_RECONNECT_DELAY", 3*time.Second),
+			ReleaseCause:     uint8(envInt("SOUNDBOARD_RELEASE_CAUSE", 0)),
+		},
 	}
 
 	switch cfg.BrewMode {
-	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy":
+	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard":
 	default:
 		return cfg, fmt.Errorf("invalid BREW_MODE=%q", cfg.BrewMode)
 	}
