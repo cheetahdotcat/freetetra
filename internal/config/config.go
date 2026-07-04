@@ -30,6 +30,7 @@ type Config struct {
 	Soundboard SoundboardConfig
 	Link       LinkConfig
 	Blechelse  BlechelseConfig
+	SimplexPTT SimplexPTTConfig
 	RadioID    RadioIDConfig
 	APRS       APRSConfig
 	MOTD       MOTDConfig
@@ -271,6 +272,30 @@ type BlechelseConfig struct {
 	Languages []string
 }
 
+// SimplexPTTConfig configures the browser push-to-talk module. It serves a
+// small web UI + a WebSocket that carries raw PCM both ways: the browser's
+// microphone streams up (hold-to-talk) and gets encoded into TETRA voice on
+// the selected talkgroup, while received traffic on any configured TG is
+// decoded and streamed back down to every connected listener. Half-duplex,
+// like a real radio: one talker keys the channel at a time.
+type SimplexPTTConfig struct {
+	Enabled    bool
+	ListenAddr string
+	Talkgroups []uint32 // TGs the UI can select; first is the default
+	BrewISSI   uint32   // brew-client login identity
+	// SourceISSIBase is the floor for per-session source ISSIs. Each browser
+	// session hashes to base+(hash%100000) so RX call-control shows who is
+	// talking. The stamped source needs no separate registration — the brew
+	// server accepts TX from the affiliated module regardless.
+	SourceISSIBase uint32
+	EncoderBin     string // streaming PCM(s16le/8k/mono) -> 18-byte ACELP
+	DecoderBin     string // streaming 18-byte ACELP -> PCM(s16le/8k/mono)
+	FrameInterval  time.Duration
+	LeadInPadding  time.Duration // silent frames emitted right after key-up
+	TailOutPadding time.Duration // silent frames emitted just before release
+	ReleaseCause   uint8
+}
+
 func LoadFromEnv() (Config, error) {
 	_ = loadDotEnv(".env")
 
@@ -487,10 +512,23 @@ func LoadFromEnv() (Config, error) {
 			ReconnectDelay:   envDuration("SOUNDBOARD_RECONNECT_DELAY", 3*time.Second),
 			ReleaseCause:     uint8(envInt("SOUNDBOARD_RELEASE_CAUSE", 0)),
 		},
+		SimplexPTT: SimplexPTTConfig{
+			Enabled:        envBool("SIMPLEXPTT_ENABLED", false),
+			ListenAddr:     env("SIMPLEXPTT_LISTEN_ADDR", ":8205"),
+			Talkgroups:     parseUint32CSV(env("SIMPLEXPTT_TALKGROUPS", "10")),
+			BrewISSI:       uint32(envInt("SIMPLEXPTT_BREW_ISSI", 899006)),
+			SourceISSIBase: uint32(envInt("SIMPLEXPTT_SOURCE_ISSI_BASE", 897000)),
+			EncoderBin:     env("SIMPLEXPTT_ENCODER_BIN", "tetra-acelp-stdio"),
+			DecoderBin:     env("SIMPLEXPTT_DECODER_BIN", "tetra-acelp-stdio-decoder"),
+			FrameInterval:  envDuration("SIMPLEXPTT_FRAME_INTERVAL", 60*time.Millisecond),
+			LeadInPadding:  envDuration("SIMPLEXPTT_LEAD_IN", 240*time.Millisecond),
+			TailOutPadding: envDuration("SIMPLEXPTT_TAIL_OUT", 120*time.Millisecond),
+			ReleaseCause:   uint8(envInt("SIMPLEXPTT_RELEASE_CAUSE", 0)),
+		},
 	}
 
 	switch cfg.BrewMode {
-	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link", "blechelse":
+	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link", "blechelse", "simplexptt":
 	default:
 		return cfg, fmt.Errorf("invalid BREW_MODE=%q", cfg.BrewMode)
 	}

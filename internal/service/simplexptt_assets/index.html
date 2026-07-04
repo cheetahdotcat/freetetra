@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Simplex PTT</title>
+<style>
+  :root {
+    --bg: #10141a; --panel: #1a212b; --line: #2b3746;
+    --fg: #e7eef7; --muted: #8ba0b6;
+    --accent: #2f81f7; --tx: #e5484d; --rx: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 20px; gap: 18px; -webkit-user-select: none; user-select: none;
+    touch-action: manipulation;
+  }
+  h1 { font-size: 18px; margin: 4px 0 0; font-weight: 600; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; width: 100%; max-width: 420px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  label { color: var(--muted); font-size: 13px; }
+  select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 15px; min-width: 130px;
+  }
+  #ptt {
+    width: 100%; max-width: 420px; height: 210px; border: none; border-radius: 16px;
+    background: var(--accent); color: #fff; font-size: 22px; font-weight: 700;
+    letter-spacing: .5px; cursor: pointer; transition: background .08s, transform .05s;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  }
+  #ptt .hint { font-size: 12px; font-weight: 500; opacity: .85; }
+  #ptt.keyed { background: var(--tx); transform: scale(0.99); }
+  #ptt:disabled { background: #384250; color: var(--muted); cursor: default; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px; border-radius: 999px; font-size: 13px; background: #0d1117;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #4b5563; }
+  .dot.tx { background: var(--tx); box-shadow: 0 0 8px var(--tx); }
+  .dot.rx { background: var(--rx); box-shadow: 0 0 8px var(--rx); }
+  #status { min-height: 20px; text-align: center; }
+  #enable {
+    padding: 14px 22px; border: none; border-radius: 12px; background: var(--accent);
+    color: #fff; font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  .hidden { display: none !important; }
+  .err { color: var(--tx); }
+  .mono { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h1>Simplex PTT</h1>
+  <div class="sub">browser talk / listen &middot; half-duplex</div>
+
+  <button id="enable">🎙️ Enable audio &amp; connect</button>
+
+  <div id="app" class="hidden" style="display:flex; flex-direction:column; align-items:center; gap:18px; width:100%;">
+    <div class="card">
+      <div class="row">
+        <label for="tg">Talkgroup</label>
+        <select id="tg"></select>
+      </div>
+    </div>
+
+    <button id="ptt" disabled>
+      <span>HOLD TO TALK</span>
+      <span class="hint">press &amp; hold &middot; or spacebar</span>
+    </button>
+
+    <div class="row" style="max-width:420px; width:100%;">
+      <span class="pill"><span id="txdot" class="dot"></span><span id="txlabel">idle</span></span>
+      <span class="pill"><span id="rxdot" class="dot"></span><span id="rxlabel">no traffic</span></span>
+    </div>
+
+    <div id="status" class="sub mono"></div>
+    <div class="sub">your ID: <span id="myissi" class="mono">—</span></div>
+  </div>
+
+<script>
+const SAMPLE_RATE = 8000;
+
+// --- capture worklet: forwards raw mic blocks (Float32) to the main thread ---
+const captureWorklet = `
+class Cap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor('cap', Cap);
+`;
+
+let ws, actx, rxGain, micNode, micStream;
+let keyed = false;    // PTT button/spacebar physically held
+let granted = false;  // server granted the talk-lock
+let myIssi = 0;
+let playHead = 0;
+
+const $ = (id) => document.getElementById(id);
+const wsURL = () => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+
+function setStatus(msg, isErr) {
+  const el = $('status');
+  el.textContent = msg || '';
+  el.className = 'sub mono' + (isErr ? ' err' : '');
+}
+
+$('enable').addEventListener('click', async () => {
+  try {
+    actx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    await actx.resume();
+    rxGain = actx.createGain();
+    rxGain.connect(actx.destination);
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const blobURL = URL.createObjectURL(new Blob([captureWorklet], { type: 'application/javascript' }));
+    await actx.audioWorklet.addModule(blobURL);
+    const src = actx.createMediaStreamSource(micStream);
+    micNode = new AudioWorkletNode(actx, 'cap');
+    micNode.port.onmessage = (e) => onMicBlock(e.data);
+    src.connect(micNode);
+    // The worklet must be in the graph to run; route it to a muted sink.
+    const sink = actx.createGain(); sink.gain.value = 0;
+    micNode.connect(sink); sink.connect(actx.destination);
+
+    $('enable').classList.add('hidden');
+    $('app').classList.remove('hidden');
+    connect();
+  } catch (err) {
+    setStatus('audio/mic error: ' + err.message, true);
+  }
+});
+
+function connect() {
+  ws = new WebSocket(wsURL());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setStatus('connected');
+  ws.onclose = () => { setStatus('disconnected — reconnecting…', true); $('ptt').disabled = true; setTimeout(connect, 1500); };
+  ws.onerror = () => setStatus('connection error', true);
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') onControl(JSON.parse(e.data));
+    else playPCM(new Int16Array(e.data));
+  };
+}
+
+function onControl(msg) {
+  switch (msg.type) {
+    case 'hello':
+      myIssi = msg.issi;
+      $('myissi').textContent = msg.issi;
+      buildTGs(msg.talkgroups, msg.selected_tg);
+      $('ptt').disabled = false;
+      break;
+    case 'state':
+      renderState(msg);
+      break;
+    case 'ptt_granted':
+      granted = true;
+      if (!keyed) sendPTT('down'); // released before the grant landed
+      break;
+    case 'ptt_denied':
+      granted = false; keyed = false; setKeyedUI(false);
+      setStatus('channel busy' + (msg.by ? ' — ' + msg.by + ' is talking' : ''), true);
+      break;
+    case 'ptt_ended':
+      granted = false;
+      break;
+  }
+}
+
+function buildTGs(list, selected) {
+  const sel = $('tg');
+  sel.innerHTML = '';
+  (list || []).forEach((tg) => {
+    const o = document.createElement('option');
+    o.value = tg; o.textContent = 'TG ' + tg;
+    if (tg === selected) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'select_tg', tg: Number(sel.value) }));
+}
+
+function renderState(s) {
+  const talking = s.local_talker && s.local_talker !== myIssi;
+  const rx = (s.rx || []).filter((r) => r.source !== myIssi);
+  const rxDot = $('rxdot'), rxLabel = $('rxlabel');
+  if (rx.length) {
+    rxDot.className = 'dot rx';
+    rxLabel.textContent = 'RX ' + rx.map((r) => r.source + '→TG' + r.tg).join(', ');
+  } else {
+    rxDot.className = 'dot';
+    rxLabel.textContent = 'no traffic';
+  }
+  // Disable keying if someone else holds the local lock and we aren't keyed.
+  if (talking && !keyed) {
+    $('ptt').disabled = true;
+    setStatus(s.local_talker + ' is talking');
+  } else if (ws && ws.readyState === 1) {
+    $('ptt').disabled = false;
+    if (!keyed) setStatus('connected');
+  }
+}
+
+// --- TX: microphone blocks -> Int16LE -> websocket, only while keyed+granted ---
+function onMicBlock(float32) {
+  if (!keyed || !granted || !ws || ws.readyState !== 1) return;
+  const n = float32.length;
+  const pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  ws.send(pcm.buffer);
+}
+
+// --- RX: Int16LE frames -> scheduled playback (muted while we transmit) ---
+function playPCM(int16) {
+  if (keyed) return; // half-duplex: don't play while transmitting
+  const n = int16.length;
+  if (!n) return;
+  const buf = actx.createBuffer(1, n, SAMPLE_RATE);
+  const f = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) f[i] = int16[i] / 32768;
+  const now = actx.currentTime;
+  if (playHead < now + 0.06) playHead = now + 0.06; // (re)prime the jitter buffer
+  const src = actx.createBufferSource();
+  src.buffer = buf;
+  src.connect(rxGain);
+  src.start(playHead);
+  playHead += n / SAMPLE_RATE;
+}
+
+// --- PTT control ---
+function sendPTT(state) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ptt', state }));
+}
+function setKeyedUI(on) {
+  const btn = $('ptt');
+  btn.classList.toggle('keyed', on);
+  btn.querySelector('span').textContent = on ? '● TRANSMITTING' : 'HOLD TO TALK';
+  $('txdot').className = 'dot' + (on ? ' tx' : '');
+  $('txlabel').textContent = on ? 'transmitting' : 'idle';
+}
+function keyDown() {
+  if (keyed || $('ptt').disabled) return;
+  keyed = true; granted = false;
+  setKeyedUI(true);
+  setStatus('keying…');
+  sendPTT('up');
+}
+function keyUp() {
+  if (!keyed) return;
+  keyed = false; granted = false;
+  setKeyedUI(false);
+  setStatus('connected');
+  sendPTT('down');
+}
+
+const btn = $('ptt');
+btn.addEventListener('pointerdown', (e) => { e.preventDefault(); keyDown(); });
+btn.addEventListener('pointerup', (e) => { e.preventDefault(); keyUp(); });
+btn.addEventListener('pointercancel', keyUp);
+btn.addEventListener('pointerleave', keyUp);
+window.addEventListener('blur', keyUp);
+window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !e.repeat) { e.preventDefault(); keyDown(); } });
+window.addEventListener('keyup', (e) => { if (e.code === 'Space') { e.preventDefault(); keyUp(); } });
+</script>
+</body>
+</html>

@@ -36,6 +36,30 @@ services:
       - freetetra
     restart: unless-stopped
 
+  # Second webradio instance, transmitting the same stream on TG 15002.
+  webradio2:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-webradio2
+    entrypoint: ["/app/tetra-brew-webradio"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_WEBRADIO2_FILE:-.env}
+    environment:
+      BREW_MODE: webradio
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635723"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      WEBRADIO_ENABLED: "true"
+      WEBRADIO_STREAM_URL: "https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3"
+      WEBRADIO_TALKGROUP: "15002"
+      WEBRADIO_SOURCE_ISSI: "124"
+      WEBRADIO_ENCODER_BIN: /app/tetra-acelp-stdio
+      WEBRADIO_RECONNECT_DELAY: "5s"
+    depends_on:
+      - freetetra
+    restart: unless-stopped
+
   echo:
     build: .
     image: freetetra:latest
@@ -93,7 +117,11 @@ services:
       - ${ENV_SOUNDBOARD_FILE:-.env}
     environment:
       BREW_MODE: soundboard
-      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      # Point at free2.tetra.cat — the local freetetra has no MS subscribers
+      # on TG 15001 (recipients=0 in its logs) and FEDERATION_PEERS is empty,
+      # so TX from here lands nowhere. free2 should have real listeners and,
+      # via its own FEDERATION_PEERS, fan the call out to free.tetra.cat too.
+      BREW_CLIENT_BASE_URL: https://free.tetra.cat
       BREW_CLIENT_USERNAME: "2635721"
       BREW_CLIENT_PASSWORD: "blafablafa"
       SOUNDBOARD_ENABLED: "true"
@@ -106,6 +134,37 @@ services:
       - ./sounds:/app/sounds
     ports:
       - "8203:8203"
+    depends_on:
+      - freetetra
+    restart: unless-stopped
+
+  # Browser push-to-talk: talk/listen on a talkgroup from the browser.
+  # Half-duplex — hold-to-talk keys the channel, releasing returns to listening.
+  # Opt-in app. Bring it up explicitly with:
+  #   docker compose --profile ptt up -d simplexptt
+  # then open http://<host>:8205/ , grant mic access, and hold to talk.
+  simplexptt:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-simplexptt
+    profiles: ["ptt"]
+    entrypoint: ["/app/tetra-brew-simplexptt"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_SIMPLEXPTT_FILE:-.env}
+    environment:
+      BREW_MODE: simplexptt
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635722"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      SIMPLEXPTT_ENABLED: "true"
+      SIMPLEXPTT_LISTEN_ADDR: ":8205"
+      SIMPLEXPTT_TALKGROUPS: "10"
+      SIMPLEXPTT_BREW_ISSI: "899006"
+      SIMPLEXPTT_ENCODER_BIN: /app/tetra-acelp-stdio
+      SIMPLEXPTT_DECODER_BIN: /app/tetra-acelp-stdio-decoder
+    ports:
+      - "8205:8205"
     depends_on:
       - freetetra
     restart: unless-stopped
