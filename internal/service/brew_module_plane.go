@@ -444,6 +444,20 @@ func (p *BrewModulePlane) InjectedPacketFrame(_ string, callID uuid.UUID, data [
 	_ = p.enqueue(brew.BuildPacketDataFrame(callID, uint16(len(data)*8), data))
 }
 
+// SendCallControlWire enqueues a pre-built call-control message as-is. Modules
+// that drive the full call state machine themselves (e.g. the SIP gateway)
+// assemble their own brew.Build* control payloads and hand them over verbatim.
+func (p *BrewModulePlane) SendCallControlWire(payload []byte) bool {
+	return p.enqueue(payload)
+}
+
+// SendFrame enqueues a raw frame (traffic or packet data) with an explicit
+// frame type and bit length, for callers that have already framed the payload
+// rather than going through the codec-normalizing Injected* helpers.
+func (p *BrewModulePlane) SendFrame(frameType uint8, callID uuid.UUID, lengthBits uint16, data []byte) bool {
+	return p.enqueue(brew.BuildFrame(frameType, callID, lengthBits, data))
+}
+
 func (p *BrewModulePlane) GroupSubscriberCount(gssi uint32) int {
 	p.attachMu.RLock()
 	defer p.attachMu.RUnlock()

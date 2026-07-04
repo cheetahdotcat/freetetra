@@ -168,3 +168,54 @@ services:
     depends_on:
       - freetetra
     restart: unless-stopped
+
+  # SIP <-> TETRA gateway: bridges individual (private) calls between a SIP/RTP
+  # peer (PBX/softphone) and the TETRA network. TETRA users call SIP_GATEWAY_ISSI
+  # to reach SIP; inbound SIP INVITEs are routed to a TETRA ISSI by the dialed
+  # number. Audio is transcoded between RTP (ACELP payload) and TETRA traffic.
+  #
+  # Opt-in — it needs a real SIP registrar + credentials, so it does NOT start on
+  # a plain `docker compose up`. Fill in the SIP_* placeholders below, then:
+  #   docker compose --profile sip up -d sip
+  # RTP needs a routable address: set SIP_RTP_ADVERTISE_IP to the host's public
+  # IP (behind NAT), or run this service with network_mode: host.
+  sip:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-sip
+    profiles: ["sip"]
+    entrypoint: ["/app/tetra-brew-sip"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_SIP_FILE:-.env}
+    environment:
+      BREW_MODE: sip
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635724"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      SIP_ENABLED: "true"
+      # TETRA identity of the gateway (individual subscriber). Callable from radios.
+      SIP_GATEWAY_ISSI: "899007"
+      # --- SIP registrar / proxy (REQUIRED — placeholders) ---
+      SIP_SERVER_ADDR: "sip.example.com:5060"   # host:port of your SIP server
+      SIP_DOMAIN: "example.com"                  # SIP domain / realm
+      SIP_USERNAME: "changeme"                   # SIP auth user
+      SIP_PASSWORD: "changeme"                   # SIP auth password
+      SIP_LOCAL_USER: "brew"                     # local AOR user part
+      SIP_TRANSPORT: "udp"
+      SIP_REGISTER_ENABLED: "true"
+      SIP_REGISTER_EXPIRES: "3600"
+      # --- media (RTP) ---
+      SIP_BIND_ADDR: "0.0.0.0:5060"
+      SIP_RTP_BIND_ADDR: "0.0.0.0"
+      SIP_RTP_PORT_START: "10000"
+      SIP_RTP_ADVERTISE_IP: ""                   # set to the host's routable IP
+      SIP_ACELP_PAYLOAD_TYPE: "96"
+      # ISSI assigned to inbound SIP callers when the dialed number can't be mapped
+      SIP_INBOUND_DEFAULT_ISSI: "0"
+    ports:
+      - "5060:5060/udp"
+      - "10000-10020:10000-10020/udp"
+    depends_on:
+      - freetetra
+    restart: unless-stopped

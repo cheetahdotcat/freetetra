@@ -622,6 +622,7 @@ func (b *SIPBridge) startOutboundInvite(sess *sipCallSession) {
 		ok = true
 	}
 	if !ok {
+		inviteCancel()
 		b.logger.Printf("sip outbound missing RTP SDP answer call=%s", sess.callID.String())
 		_ = b.plane.SendCallControlWire(brew.BuildCallRelease(sess.callID, b.cfg.SIP.ReleaseCause))
 		b.mu.Lock()
@@ -1278,15 +1279,16 @@ func (b *SIPBridge) registerOnce(ctx context.Context) (time.Duration, error) {
 		return 0, fmt.Errorf("register status=%d", res.StatusCode)
 	}
 
-	expires := b.cfg.SIP.RegisterExpires
-	if expires <= 0 {
-		expires = 120 * time.Second
+	expiresSec := b.cfg.SIP.RegisterExpires
+	if expiresSec <= 0 {
+		expiresSec = 120
 	}
 	if hdr := res.GetHeader("Expires"); hdr != nil {
 		if sec, err := strconv.Atoi(strings.TrimSpace(hdr.Value())); err == nil && sec > 0 {
-			expires = time.Duration(sec) * time.Second
+			expiresSec = sec
 		}
 	}
+	expires := time.Duration(expiresSec) * time.Second
 	next := (expires * 3) / 4
 	if next < 15*time.Second {
 		next = 15 * time.Second
@@ -1301,11 +1303,11 @@ func (b *SIPBridge) buildRegisterRequest() *sip.Request {
 	req.SetTransport(strings.ToUpper(strings.TrimSpace(b.cfg.SIP.Transport)))
 	req.SetDestination(b.cfg.SIP.ServerAddr)
 	req.AppendHeader(sip.NewHeader("Contact", b.registerContactHeaderValue()))
-	expires := b.cfg.SIP.RegisterExpires
-	if expires <= 0 {
-		expires = 120 * time.Second
+	expiresSec := b.cfg.SIP.RegisterExpires
+	if expiresSec <= 0 {
+		expiresSec = 120
 	}
-	req.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(int(expires/time.Second))))
+	req.AppendHeader(sip.NewHeader("Expires", strconv.Itoa(expiresSec)))
 	return req
 }
 

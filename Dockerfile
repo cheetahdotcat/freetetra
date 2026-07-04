@@ -39,6 +39,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/t
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-link ./cmd/tetra-brew-link
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-blechelse ./cmd/tetra-brew-blechelse
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-simplexptt ./cmd/tetra-brew-simplexptt
+RUN CGO_ENABLED=1 GOOS=linux go build -ldflags '-extldflags "-static"' -o /out/tetra-brew-sip ./cmd/tetra-brew-sip
 
 # Build ACELP encoder/decoder from included source.
 # Only the non-main sources go in; encoder.c/encoder_stdio.c/decoder.c each
@@ -61,6 +62,7 @@ COPY --from=build /out/tetra-brew-soundboard /app/tetra-brew-soundboard
 COPY --from=build /out/tetra-brew-link /app/tetra-brew-link
 COPY --from=build /out/tetra-brew-blechelse /app/tetra-brew-blechelse
 COPY --from=build /out/tetra-brew-simplexptt /app/tetra-brew-simplexptt
+COPY --from=build /out/tetra-brew-sip /app/tetra-brew-sip
 COPY --from=build /out/tetra-acelp-stdio /app/tetra-acelp-stdio
 COPY --from=build /out/tetra-acelp-decoder /app/tetra-acelp-decoder
 COPY --from=build /out/tetra-acelp-stdio-decoder /app/tetra-acelp-stdio-decoder

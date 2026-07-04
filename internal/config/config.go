@@ -528,7 +528,7 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	switch cfg.BrewMode {
-	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link", "blechelse", "simplexptt":
+	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link", "blechelse", "simplexptt", "sip":
 	default:
 		return cfg, fmt.Errorf("invalid BREW_MODE=%q", cfg.BrewMode)
 	}
