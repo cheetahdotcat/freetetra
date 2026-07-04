@@ -28,6 +28,7 @@ type Config struct {
 	Echo       EchoConfig
 	Proxy      ProxyConfig
 	Soundboard SoundboardConfig
+	Link       LinkConfig
 	RadioID    RadioIDConfig
 	APRS       APRSConfig
 	MOTD       MOTDConfig
@@ -204,6 +205,25 @@ type ProxyConfig struct {
 	DialTimeout   time.Duration
 	IdleTimeout   time.Duration
 	MaxConcurrent int
+}
+
+// LinkConfig configures the TG-linking module. Each pair mirrors traffic
+// bidirectionally between two talkgroups: a call on TG A is re-transmitted
+// on TG B (using LinkSourceISSI as the source) and vice versa. The bridge
+// filters out its own re-broadcasts via SourceISSI match to avoid loops.
+type LinkConfig struct {
+	// Pairs is a list of TG pairs; each entry links its two GSSIs
+	// bidirectionally. Empty means the bridge does nothing.
+	Pairs         []LinkPair
+	BrewISSI      uint32 // identity used for the brew-client login
+	SourceISSI    uint32 // ISSI stamped on mirrored TX frames; falls back to BrewISSI
+	ReleaseCause  uint8
+	MirrorHangoff time.Duration // wait this long after origin release before closing the mirror, to catch late frames
+}
+
+type LinkPair struct {
+	A uint32
+	B uint32
 }
 
 type SoundboardConfig struct {
@@ -397,6 +417,13 @@ func LoadFromEnv() (Config, error) {
 			IdleTimeout:   envDuration("PROXY_IDLE_TIMEOUT", 60*time.Second),
 			MaxConcurrent: envInt("PROXY_MAX_CONCURRENT", 4),
 		},
+		Link: LinkConfig{
+			Pairs:         parseLinkPairs(env("LINK_PAIRS", "")),
+			BrewISSI:      uint32(envInt("LINK_BREW_ISSI", 899004)),
+			SourceISSI:    uint32(envInt("LINK_SOURCE_ISSI", 0)),
+			ReleaseCause:  uint8(envInt("LINK_RELEASE_CAUSE", 0)),
+			MirrorHangoff: envDuration("LINK_MIRROR_HANGOFF", 200*time.Millisecond),
+		},
 		Soundboard: SoundboardConfig{
 			Enabled:          envBool("SOUNDBOARD_ENABLED", false),
 			ListenAddr:       env("SOUNDBOARD_LISTEN_ADDR", ":8203"),
@@ -417,7 +444,7 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	switch cfg.BrewMode {
-	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard":
+	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link":
 	default:
 		return cfg, fmt.Errorf("invalid BREW_MODE=%q", cfg.BrewMode)
 	}
@@ -495,6 +522,41 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+// parseLinkPairs parses "10:10000,11:10001,12:10002" into paired GSSIs.
+// Whitespace and empty entries are ignored; malformed entries are skipped.
+// A pair (X, X) is dropped — linking a TG to itself would just echo.
+func parseLinkPairs(raw string) []LinkPair {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]LinkPair, 0, len(parts))
+	for _, entry := range parts {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		ab := strings.SplitN(entry, ":", 2)
+		if len(ab) != 2 {
+			continue
+		}
+		a, err := strconv.ParseUint(strings.TrimSpace(ab[0]), 10, 32)
+		if err != nil || a == 0 {
+			continue
+		}
+		b, err := strconv.ParseUint(strings.TrimSpace(ab[1]), 10, 32)
+		if err != nil || b == 0 {
+			continue
+		}
+		if uint32(a) == uint32(b) {
+			continue
+		}
+		out = append(out, LinkPair{A: uint32(a), B: uint32(b)})
+	}
+	return out
 }
 
 func envCSV(key string) []string {

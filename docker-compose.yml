@@ -56,6 +56,29 @@ services:
       - freetetra
     restart: unless-stopped
 
+  # Bidirectional TG linker: mirrors traffic between paired talkgroups
+  # so users on either side hear each other.
+  link:
+    build: .
+    image: freetetra:latest
+    container_name: freetetra-link
+    entrypoint: ["/app/tetra-brew-link"]
+    env_file:
+      - ${ENV_COMMON_FILE:-.env}
+      - ${ENV_LINK_FILE:-.env}
+    environment:
+      BREW_MODE: link
+      BREW_CLIENT_BASE_URL: http://freetetra:8101
+      BREW_CLIENT_USERNAME: "2635724"
+      BREW_CLIENT_PASSWORD: "blafablafa"
+      LINK_BREW_ISSI: "899004"
+      LINK_SOURCE_ISSI: "899004"
+      LINK_PAIRS: "10:10000,11:10001,12:10002"
+      LINK_MIRROR_HANGOFF: "200ms"
+    depends_on:
+      - freetetra
+    restart: unless-stopped
+
   # Opt-in app. Bring it up explicitly with:
   #   docker compose --profile soundboard up -d soundboard
   # Default `docker compose up` skips it so the base stack stays minimal.
