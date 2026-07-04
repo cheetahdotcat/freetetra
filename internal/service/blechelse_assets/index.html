@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>FreeTetra Blechelse</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0a0d12;
+      --bg-card: #111827;
+      --bg-input: #1a2030;
+      --bg-hover: #202a3d;
+      --border: #1f2937;
+      --border-hover: #374151;
+      --text: #e5e7eb;
+      --text-dim: #9ca3af;
+      --text-muted: #6b7280;
+      --accent: #a78bfa;
+      --accent-dim: #6d5aa9;
+      --green: #6ee7b7;
+      --blue: #60a5fa;
+      --red: #f87171;
+      --amber: #fbbf24;
+    }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; min-height: 100vh; }
+    * { box-sizing: border-box; }
+    .shell { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+    h1 { font-size: 1.5rem; font-weight: 700; margin: 0; }
+    h1 span { color: var(--accent); }
+    h2 { font-size: 0.8rem; font-weight: 600; margin: 20px 0 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+    .meta { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.8rem; color: var(--text-dim); }
+    .status { font-family: "JetBrains Mono", monospace; font-size: 0.85rem; color: var(--text-dim); }
+    .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); margin-right: 6px; vertical-align: middle; }
+    .status.busy .dot { background: var(--red); animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+
+    .searchbox { position: relative; }
+    input[type="text"], select, button {
+      background: var(--bg-input); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px 12px; font-size: 0.95rem; font-family: inherit;
+    }
+    input[type="text"] { width: 100%; }
+    input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+    input[type="text"]::placeholder { color: var(--text-muted); }
+
+    .filter-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+    .filter-row label { font-size: 0.85rem; color: var(--text-dim); }
+    .filter-row select { padding: 6px 10px; font-size: 0.9rem; }
+
+    .results { max-height: 340px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); margin-top: 12px; }
+    .results:empty { display: none; }
+    .result-row {
+      display: grid; grid-template-columns: 1fr auto auto; gap: 12px; align-items: center;
+      padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border);
+    }
+    .result-row:last-child { border-bottom: none; }
+    .result-row:hover { background: var(--bg-hover); }
+    .result-primary { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .result-content { font-size: 0.95rem; color: var(--text); overflow-wrap: anywhere; }
+    .result-name { font-family: "JetBrains Mono", monospace; font-size: 0.8rem; color: var(--text-dim); overflow-wrap: anywhere; }
+    .result-cat { font-size: 0.75rem; color: var(--text-muted); font-family: "JetBrains Mono", monospace; }
+    .result-lang { font-size: 0.7rem; color: var(--accent); font-weight: 600; padding: 2px 6px; border: 1px solid var(--accent-dim); border-radius: 3px; }
+    .no-hits { padding: 14px; color: var(--text-muted); text-align: center; font-size: 0.9rem; }
+
+    .queue { margin-top: 20px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); padding: 12px; }
+    .queue-empty { color: var(--text-muted); font-size: 0.9rem; text-align: center; padding: 20px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--bg-input); border: 1px solid var(--border-hover); border-radius: 4px;
+      padding: 4px 4px 4px 10px; font-family: "JetBrains Mono", monospace; font-size: 0.85rem;
+    }
+    .chip-name { color: var(--text); }
+    .chip-controls { display: flex; gap: 2px; }
+    .chip-btn {
+      background: transparent; border: none; color: var(--text-dim); font-size: 0.9rem;
+      cursor: pointer; padding: 2px 6px; border-radius: 3px;
+    }
+    .chip-btn:hover { background: var(--bg-hover); color: var(--text); }
+    .chip-btn.remove:hover { color: var(--red); }
+
+    .actions { display: flex; gap: 10px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
+    button {
+      cursor: pointer; font-weight: 600; transition: background 0.1s, border-color 0.1s;
+    }
+    button.primary { background: var(--accent); color: #1a1129; border-color: var(--accent); }
+    button.primary:hover:not(:disabled) { background: #b79dff; }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.danger { background: var(--red); color: #2a0f10; border-color: var(--red); }
+    button.danger:hover { background: #ff8f8f; }
+    button.ghost { background: transparent; }
+    button.ghost:hover { background: var(--bg-hover); }
+    label.tg-select { display: inline-flex; align-items: center; gap: 8px; font-size: 0.9rem; color: var(--text-dim); }
+
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: var(--bg-card); border: 1px solid var(--border-hover); border-radius: 6px;
+      padding: 10px 16px; font-size: 0.9rem; opacity: 0; transition: opacity 0.2s;
+      pointer-events: none; z-index: 100;
+    }
+    .toast.show { opacity: 1; }
+    .toast.error { border-color: var(--red); color: var(--red); }
+    .toast.ok { border-color: var(--green); color: var(--green); }
+
+    kbd { background: var(--bg-input); border: 1px solid var(--border-hover); border-bottom-width: 2px; border-radius: 3px; padding: 1px 6px; font-family: "JetBrains Mono", monospace; font-size: 0.75rem; color: var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Free<span>Tetra</span> Blechelse</h1>
+      <div class="status" id="status"><span class="dot"></span><span id="status-text">idle</span></div>
+    </header>
+
+    <div class="searchbox">
+      <input id="q" type="text" autocomplete="off" placeholder="Search a word… (e.g. Abfahrt, Kassel, gleis, 8000105)" />
+    </div>
+    <div class="filter-row">
+      <label>Language
+        <select id="lang">
+          <option value="">all</option>
+          <option value="dt">dt (German)</option>
+          <option value="en">en (English)</option>
+          <option value="gong">gong</option>
+        </select>
+      </label>
+      <span class="meta" id="catalog-info"></span>
+      <span class="meta" style="margin-left:auto">
+        <kbd>Enter</kbd> = append top hit · <kbd>Ctrl+Enter</kbd> = Play
+      </span>
+    </div>
+
+    <div class="results" id="results"></div>
+
+    <h2>Queue</h2>
+    <div class="queue">
+      <div id="queue-empty" class="queue-empty">Nothing queued yet — search above and click a result to append it.</div>
+      <div id="chips" class="chips"></div>
+      <div class="actions">
+        <label class="tg-select">TG
+          <select id="tg"></select>
+        </label>
+        <button id="play" class="primary">▶ Play</button>
+        <button id="stop" class="danger">■ Stop</button>
+        <button id="clear" class="ghost">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    (function () {
+      const q = document.getElementById("q");
+      const langSel = document.getElementById("lang");
+      const resultsEl = document.getElementById("results");
+      const chipsEl = document.getElementById("chips");
+      const queueEmpty = document.getElementById("queue-empty");
+      const tgSel = document.getElementById("tg");
+      const playBtn = document.getElementById("play");
+      const stopBtn = document.getElementById("stop");
+      const clearBtn = document.getElementById("clear");
+      const statusEl = document.getElementById("status");
+      const statusText = document.getElementById("status-text");
+      const catalogInfo = document.getElementById("catalog-info");
+      const toastEl = document.getElementById("toast");
+
+      // Queue is an array of {id, name, category, lang}. Objects (not IDs)
+      // so the chips render without extra lookups on the sample catalog.
+      const queue = [];
+      let lastResults = [];
+
+      function toast(msg, kind) {
+        toastEl.textContent = msg;
+        toastEl.className = "toast show " + (kind || "");
+        clearTimeout(toast._t);
+        toast._t = setTimeout(() => { toastEl.className = "toast"; }, 2400);
+      }
+
+      function debounce(fn, ms) {
+        let t;
+        return function () {
+          clearTimeout(t);
+          const args = arguments;
+          t = setTimeout(() => fn.apply(null, args), ms);
+        };
+      }
+
+      async function loadTalkgroups() {
+        try {
+          const r = await fetch("/api/talkgroups");
+          const data = await r.json();
+          tgSel.innerHTML = "";
+          (data.talkgroups || []).forEach((tg, i) => {
+            const opt = document.createElement("option");
+            opt.value = String(tg);
+            opt.textContent = String(tg);
+            if (i === 0) opt.selected = true;
+            tgSel.appendChild(opt);
+          });
+        } catch (e) {
+          toast("Failed to load TGs: " + e.message, "error");
+        }
+      }
+
+      async function refreshState() {
+        try {
+          const r = await fetch("/api/state");
+          const s = await r.json();
+          if (s.busy) {
+            statusEl.classList.add("busy");
+            statusText.textContent = "transmitting…";
+          } else {
+            statusEl.classList.remove("busy");
+            statusText.textContent = "idle";
+          }
+          if (s.catalog) catalogInfo.textContent = s.catalog.toLocaleString() + " samples in catalog";
+        } catch (e) { /* ignore */ }
+      }
+
+      async function search() {
+        const query = q.value.trim();
+        const lang = langSel.value;
+        const params = new URLSearchParams();
+        if (query) params.set("q", query);
+        if (lang) params.set("lang", lang);
+        params.set("limit", "40");
+        try {
+          const r = await fetch("/api/search?" + params.toString());
+          const data = await r.json();
+          lastResults = data.results || [];
+          renderResults(lastResults);
+        } catch (e) {
+          toast("Search failed: " + e.message, "error");
+        }
+      }
+      const searchDebounced = debounce(search, 120);
+
+      function renderResults(rows) {
+        resultsEl.innerHTML = "";
+        if (!rows.length) {
+          const empty = document.createElement("div");
+          empty.className = "no-hits";
+          empty.textContent = "No matches";
+          resultsEl.appendChild(empty);
+          return;
+        }
+        for (const r of rows) {
+          const row = document.createElement("div");
+          row.className = "result-row";
+          row.title = "Append: " + r.id;
+          row.onclick = () => addToQueue(r);
+
+          const primary = document.createElement("div");
+          primary.className = "result-primary";
+          // If the manifest gave us spoken text, that's the headline; the
+          // filename becomes secondary. When it's absent (many samples in
+          // dt/abschnitte/ etc. have no XLS content), show the name alone.
+          if (r.content) {
+            const content = document.createElement("div");
+            content.className = "result-content";
+            content.textContent = r.content;
+            const name = document.createElement("div");
+            name.className = "result-name";
+            name.textContent = r.id;
+            primary.append(content, name);
+          } else {
+            const name = document.createElement("div");
+            name.className = "result-content";
+            name.textContent = r.name;
+            const cat = document.createElement("div");
+            cat.className = "result-name";
+            cat.textContent = r.category;
+            primary.append(name, cat);
+          }
+
+          const lang = document.createElement("div");
+          lang.className = "result-lang";
+          lang.textContent = r.lang;
+
+          const spacer = document.createElement("div");
+          spacer.style.width = "0";
+          row.append(primary, spacer, lang);
+          resultsEl.appendChild(row);
+        }
+      }
+
+      function addToQueue(sample) {
+        queue.push(sample);
+        renderQueue();
+      }
+
+      function removeFromQueue(index) {
+        queue.splice(index, 1);
+        renderQueue();
+      }
+
+      function moveInQueue(index, direction) {
+        const target = index + direction;
+        if (target < 0 || target >= queue.length) return;
+        const tmp = queue[index];
+        queue[index] = queue[target];
+        queue[target] = tmp;
+        renderQueue();
+      }
+
+      function renderQueue() {
+        chipsEl.innerHTML = "";
+        if (queue.length === 0) {
+          queueEmpty.style.display = "block";
+          playBtn.disabled = true;
+          return;
+        }
+        queueEmpty.style.display = "none";
+        playBtn.disabled = false;
+        queue.forEach((s, i) => {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          const name = document.createElement("span");
+          name.className = "chip-name";
+          name.textContent = s.content || s.name;
+          name.title = s.id + (s.content ? " — " + s.content : "");
+
+          const ctrls = document.createElement("span");
+          ctrls.className = "chip-controls";
+          const up = document.createElement("button");
+          up.className = "chip-btn";
+          up.textContent = "◀";
+          up.title = "move left";
+          up.onclick = () => moveInQueue(i, -1);
+          const down = document.createElement("button");
+          down.className = "chip-btn";
+          down.textContent = "▶";
+          down.title = "move right";
+          down.onclick = () => moveInQueue(i, 1);
+          const rm = document.createElement("button");
+          rm.className = "chip-btn remove";
+          rm.textContent = "×";
+          rm.title = "remove";
+          rm.onclick = () => removeFromQueue(i);
+
+          ctrls.append(up, down, rm);
+          chip.append(name, ctrls);
+          chipsEl.appendChild(chip);
+        });
+      }
+
+      async function play() {
+        if (queue.length === 0) return;
+        const tg = parseInt(tgSel.value, 10);
+        if (!tg) {
+          toast("Pick a TG first", "error");
+          return;
+        }
+        try {
+          const r = await fetch("/api/play", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ queue: queue.map((s) => s.id), tg: tg }),
+          });
+          if (!r.ok) {
+            const t = await r.text();
+            toast("Play failed: " + t, "error");
+            return;
+          }
+          const data = await r.json();
+          toast("Sending " + data.queued + " samples on TG " + data.tg, "ok");
+        } catch (e) {
+          toast("Play failed: " + e.message, "error");
+        }
+      }
+
+      async function stop() {
+        try {
+          const r = await fetch("/api/stop", { method: "POST" });
+          const data = await r.json();
+          toast(data.stopped ? "Stop sent" : "Nothing to stop", "ok");
+        } catch (e) {
+          toast("Stop failed: " + e.message, "error");
+        }
+      }
+
+      function clearQueue() {
+        queue.length = 0;
+        renderQueue();
+      }
+
+      q.addEventListener("input", searchDebounced);
+      langSel.addEventListener("change", search);
+      q.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          if (lastResults.length > 0) addToQueue(lastResults[0]);
+        } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+          e.preventDefault();
+          play();
+        }
+      });
+      playBtn.addEventListener("click", play);
+      stopBtn.addEventListener("click", stop);
+      clearBtn.addEventListener("click", clearQueue);
+
+      loadTalkgroups();
+      refreshState();
+      renderQueue();
+      setInterval(refreshState, 1500);
+    })();
+  </script>
+</body>
+</html>

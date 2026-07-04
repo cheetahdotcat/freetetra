@@ -29,6 +29,7 @@ type Config struct {
 	Proxy      ProxyConfig
 	Soundboard SoundboardConfig
 	Link       LinkConfig
+	Blechelse  BlechelseConfig
 	RadioID    RadioIDConfig
 	APRS       APRSConfig
 	MOTD       MOTDConfig
@@ -244,6 +245,32 @@ type SoundboardConfig struct {
 	ReleaseCause     uint8
 }
 
+// BlechelseConfig configures the Blechelse announcement-sample module. The
+// module serves a small web UI that lets a user assemble a queue of pre-cut
+// DB voice samples (words like "Gleis", station names, hours/minutes, etc.)
+// and transmit the concatenated result as one TETRA call.
+type BlechelseConfig struct {
+	Enabled            bool
+	ListenAddr         string
+	SamplesDir         string   // root that contains dt/, en/, gong/, ...
+	Talkgroups         []uint32 // TGs the UI can transmit to; first is the default
+	BrewISSI           uint32   // brew-client login identity
+	SourceISSI         uint32   // ISSI stamped on TX frames; falls back to BrewISSI
+	FFmpegBin          string
+	EncoderBin         string
+	EncoderArgs        string
+	EncoderFrameSize   int
+	FrameInterval      time.Duration
+	LeadInPadding      time.Duration // silence before the first sample in a play
+	TailOutPadding     time.Duration // silence after the last sample in a play
+	InterSamplePadding time.Duration // silence inserted between concatenated samples
+	MaxQueueLength     int
+	ReleaseCause       uint8
+	// Languages selects which top-level subfolders under SamplesDir are indexed
+	// (e.g. "dt", "en", "gong"). Empty means index everything present.
+	Languages []string
+}
+
 func LoadFromEnv() (Config, error) {
 	_ = loadDotEnv(".env")
 
@@ -417,6 +444,25 @@ func LoadFromEnv() (Config, error) {
 			IdleTimeout:   envDuration("PROXY_IDLE_TIMEOUT", 60*time.Second),
 			MaxConcurrent: envInt("PROXY_MAX_CONCURRENT", 4),
 		},
+		Blechelse: BlechelseConfig{
+			Enabled:            envBool("BLECHELSE_ENABLED", false),
+			ListenAddr:         env("BLECHELSE_LISTEN_ADDR", ":8204"),
+			SamplesDir:         env("BLECHELSE_SAMPLES_DIR", "/app/blechelse"),
+			Talkgroups:         parseUint32CSV(env("BLECHELSE_TALKGROUPS", "10")),
+			BrewISSI:           uint32(envInt("BLECHELSE_BREW_ISSI", 899005)),
+			SourceISSI:         uint32(envInt("BLECHELSE_SOURCE_ISSI", 0)),
+			FFmpegBin:          env("BLECHELSE_FFMPEG_BIN", "ffmpeg"),
+			EncoderBin:         env("BLECHELSE_ENCODER_BIN", "tetra-acelp-stdio"),
+			EncoderArgs:        env("BLECHELSE_ENCODER_ARGS", ""),
+			EncoderFrameSize:   envInt("BLECHELSE_ENCODER_FRAME_SIZE", 18),
+			FrameInterval:      envDuration("BLECHELSE_FRAME_INTERVAL", 60*time.Millisecond),
+			LeadInPadding:      envDuration("BLECHELSE_LEAD_IN", 240*time.Millisecond),
+			TailOutPadding:     envDuration("BLECHELSE_TAIL_OUT", 240*time.Millisecond),
+			InterSamplePadding: envDuration("BLECHELSE_INTER_SAMPLE_PAD", 0),
+			MaxQueueLength:     envInt("BLECHELSE_MAX_QUEUE", 50),
+			ReleaseCause:       uint8(envInt("BLECHELSE_RELEASE_CAUSE", 0)),
+			Languages:          envCSV("BLECHELSE_LANGUAGES"),
+		},
 		Link: LinkConfig{
 			Pairs:         parseLinkPairs(env("LINK_PAIRS", "")),
 			BrewISSI:      uint32(envInt("LINK_BREW_ISSI", 899004)),
@@ -444,7 +490,7 @@ func LoadFromEnv() (Config, error) {
 	}
 
 	switch cfg.BrewMode {
-	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link":
+	case "server", "hybrid", "client", "router", "webradio", "zello", "echo", "dmrbridge", "proxy", "soundboard", "link", "blechelse":
 	default:
 		return cfg, fmt.Errorf("invalid BREW_MODE=%q", cfg.BrewMode)
 	}
@@ -522,6 +568,34 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+// parseUint32CSV parses "10,11,12" into a list of uint32 GSSIs. Whitespace,
+// empty entries, and unparseable values are silently skipped.
+func parseUint32CSV(raw string) []uint32 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]uint32, 0, len(parts))
+	seen := make(map[uint32]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(p, 10, 32)
+		if err != nil || v == 0 {
+			continue
+		}
+		if _, ok := seen[uint32(v)]; ok {
+			continue
+		}
+		seen[uint32(v)] = struct{}{}
+		out = append(out, uint32(v))
+	}
+	return out
 }
 
 // parseLinkPairs parses "10:10000,11:10001,12:10002" into paired GSSIs.
