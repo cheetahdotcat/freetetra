@@ -463,6 +463,12 @@ func searchMyinstants(ctx context.Context, query string) ([]myinstantsResult, er
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// Myinstants returns 404 when a search has zero results (e.g. "Gepäck").
+	// That's a hit-count of zero, not an outage — surface it as an empty list
+	// rather than a 502 back to the browser.
+	if resp.StatusCode == http.StatusNotFound {
+		return []myinstantsResult{}, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
